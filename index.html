@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GNSS Survey Console</title>
+<style>
+  :root {
+    --bg: #0e1216; --panel: #161c22; --border: #26303a; --text: #e6edf3;
+    --muted: #8b98a5; --accent: #4fa3ff; --good: #35c46b; --warn: #e0a63c; --bad: #e0503c;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; padding: 16px; }
+  h1 { font-size: 18px; margin: 0 0 4px; }
+  .sub { color: var(--muted); margin-bottom: 16px; font-size: 13px; }
+  .intro { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; margin-bottom: 20px; font-size: 13.5px; }
+  .intro b { color: var(--accent); }
+  .intro .roles { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 10px; }
+  .intro .role { background: #0b0f13; border-radius: 8px; padding: 10px 12px; }
+  .intro .role .tag { font-weight: 700; font-size: 12px; letter-spacing: .04em; text-transform: uppercase; }
+  .intro .role.base .tag { color: var(--good); }
+  .intro .role.rover .tag { color: var(--accent); }
+  @media (max-width: 560px) { .intro .roles { grid-template-columns: 1fr; } }
+
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 16px; }
+  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; position: relative; }
+  .panel.base { border-color: #235232; }
+  .panel.point { border-color: #1d3f61; }
+  .panel h2 { font-size: 14px; margin: 0 0 2px; }
+  .panel .step-hint { color: var(--muted); font-size: 12px; margin-bottom: 12px; }
+  label { display: block; font-size: 12px; color: var(--muted); margin: 10px 0 3px; }
+  input, select { width: 100%; background: #0b0f13; border: 1px solid var(--border); color: var(--text); padding: 7px 9px; border-radius: 6px; font-size: 14px; }
+  .row { display: flex; gap: 8px; }
+  .row > * { flex: 1; }
+  button { background: var(--accent); color: #06131f; border: none; padding: 8px 14px; border-radius: 6px; font-weight: 600; cursor: pointer; font-size: 13px; margin-top: 12px; }
+  button.stop { background: var(--bad); color: #fff; }
+  button:disabled { opacity: 0.4; cursor: default; }
+  .status { margin-top: 12px; padding: 10px; background: #0b0f13; border-radius: 6px; font-family: ui-monospace, monospace; font-size: 12.5px; white-space: pre-wrap; word-break: break-word; min-height: 20px; }
+  .status.err { color: var(--bad); }
+  .badge { position: absolute; top: 14px; right: 16px; font-size: 11px; padding: 2px 8px; border-radius: 999px; background: #0b0f13; color: var(--muted); border: 1px solid var(--border); }
+  .badge.live { color: var(--good); border-color: var(--good); }
+  .checkbox-row { display: flex; align-items: center; gap: 8px; margin-top: 10px; }
+  .checkbox-row input { width: auto; }
+  .result { margin-top: 10px; }
+  .result code { display: block; background: #0b0f13; padding: 8px; border-radius: 6px; font-size: 12px; overflow-x: auto; }
+  small.hint { color: var(--muted); display: block; margin-top: 4px; }
+  details { margin-top: 4px; }
+  details summary { cursor: pointer; color: var(--muted); font-size: 12.5px; }
+</style>
+</head>
+<body>
+<h1>GNSS Survey Console</h1>
+<div class="sub">u-blox F9P RTK survey, controlled from any browser on the site network.</div>
+
+<div class="intro">
+  A single GPS is accurate to a few metres. Two GPS units working together
+  as <b>RTK</b> - one fixed, one carried around - are accurate to a couple of
+  <b>centimetres</b>. That's what this page runs:
+  <div class="roles">
+    <div class="role base">
+      <div class="tag">Base</div>
+      Plug this receiver in at the GCS and leave it there. It works out its
+      own position very precisely, then broadcasts a correction feed over
+      the network. You configure it once per survey session and don't move it.
+    </div>
+    <div class="role rover">
+      <div class="tag">Rover</div>
+      This is the receiver you carry to each point you're surveying (the
+      site origin, then each pole). It listens to the base's corrections and,
+      once locked, gives you a centimetre-accurate reading of wherever it
+      currently is.
+    </div>
+  </div>
+</div>
+
+<div class="panel" style="margin-bottom:20px;">
+  <h2>Backend server</h2>
+  <div class="step-hint">This page can be opened from anywhere, but it needs the address of the machine actually wired to your GPS receivers (your site laptop, or a tunnel URL to it).</div>
+  <div class="row">
+    <input id="serverUrl" placeholder="https://your-tunnel-address, or http://192.168.1.50:8765 on the same network" style="flex:3">
+    <button id="serverConnect" style="flex:1;margin-top:0">Connect</button>
+  </div>
+  <div id="serverStatus" class="status" style="margin-top:10px;">not connected</div>
+</div>
+
+<div class="grid">
+
+  <div class="panel">
+    <h2>Ports</h2>
+    <div class="step-hint">Both receivers should show up here once plugged in.</div>
+    <button id="refreshPorts" style="margin-top:0">Rescan /dev/ttyUSB*, /dev/ttyACM*</button>
+    <div id="portsList" class="status">-</div>
+  </div>
+
+  <div class="panel base">
+    <span id="baseBadge" class="badge">idle</span>
+    <h2>1. Base - stays at the GCS</h2>
+    <div class="step-hint">Start this first. Leave it running for the whole survey.</div>
+    <label>Serial port (the receiver staying here)</label>
+    <select id="basePort"></select>
+    <div class="row">
+      <div><label>Baud</label><input id="baseBaud" value="115200"></div>
+      <div><label>Relay TCP port</label><input id="baseRelayPort" value="6000"></div>
+    </div>
+    <div class="row">
+      <div><label>Min duration (s)</label><input id="baseMinDur" value="60"></div>
+      <div><label>Accuracy limit (m)</label><input id="baseAccLimit" value="2.0"></div>
+    </div>
+    <small class="hint">Needs open sky. "meanAcc" should shrink over 1-2 minutes; once status says "broadcasting", it's ready and the rover can use it.</small>
+    <button id="baseStart">Start base</button>
+    <button id="baseStop" class="stop" disabled>Stop</button>
+    <div id="baseStatus" class="status">idle</div>
+  </div>
+
+  <div class="panel point">
+    <span id="pointBadge" class="badge">idle</span>
+    <h2>2. Rover - survey a point</h2>
+    <div class="step-hint">Carry this receiver to the spot you're recording, then run this. Survey "origin" first.</div>
+    <label>Serial port (the receiver you're carrying)</label>
+    <select id="pointPort"></select>
+    <div class="row">
+      <div><label>Baud</label><input id="pointBaud" value="115200"></div>
+      <div><label>Duration (s)</label><input id="pointDuration" value="60"></div>
+    </div>
+    <label>Corrections from base (host:port)</label>
+    <input id="pointCorr" placeholder="e.g. localhost:6000, or 192.168.1.50:6000 if base is on another machine">
+    <label>Label</label>
+    <input id="pointLabel" placeholder="origin, camera_a, camera_b, ...">
+    <div class="checkbox-row">
+      <input type="checkbox" id="pointRequireFixed" checked>
+      <label style="margin:0">RTK FIXED epochs only (uncheck to allow FLOAT if FIXED never arrives - less accurate)</label>
+    </div>
+    <small class="hint">Survey "origin" first - its result auto-fills the fields below, so every point after that gets its east/north/up offset computed automatically.</small>
+    <div class="row">
+      <div><label>Origin lat</label><input id="originLat" placeholder="auto-filled"></div>
+      <div><label>Origin lon</label><input id="originLon" placeholder="auto-filled"></div>
+      <div><label>Origin alt (m)</label><input id="originAlt" placeholder="auto-filled"></div>
+    </div>
+    <button id="pointStart">Survey this point</button>
+    <button id="pointStop" class="stop" disabled>Stop</button>
+    <div id="pointStatus" class="status">idle</div>
+    <div id="pointResult" class="result"></div>
+  </div>
+
+  <div class="panel">
+    <span id="roverBadge" class="badge">idle</span>
+    <h2>Rover - live monitor (optional)</h2>
+    <div class="step-hint">Advanced: watch the rover's raw fix without recording a point. Useful to confirm RTK FIXED before running a survey above - starting a survey on this same port stops this monitor automatically, no need to stop it by hand first.</div>
+    <details>
+      <summary>Show</summary>
+      <label>Serial port</label>
+      <select id="roverPort"></select>
+      <div class="row">
+        <div><label>Baud</label><input id="roverBaud" value="115200"></div>
+      </div>
+      <label>Corrections from base (host:port)</label>
+      <input id="roverCorr" placeholder="e.g. localhost:6000 (leave blank for no RTK)">
+      <button id="roverStart">Start</button>
+      <button id="roverStop" class="stop" disabled>Stop</button>
+      <div id="roverStatus" class="status">idle</div>
+    </details>
+  </div>
+
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
