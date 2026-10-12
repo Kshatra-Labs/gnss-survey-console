@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- USB-serial chips this app should offer to auto-launch for. 0403:6015 is
+     the FTDI FT231X this project's F9P boards use (confirmed via MON-VER on
+     the actual hardware); the others are the common alternatives other RTK
+     boards (Ardusimple, SparkFun, generic CP210x/CH340 breakouts) ship with,
+     included so this isn't hard-locked to one specific board. -->
+<resources>
+    <!-- FTDI FT231X / FT232R -->
+    <usb-device vendor-id="1027" product-id="24597" /> <!-- 0x0403:0x6015 -->
+    <usb-device vendor-id="1027" product-id="24577" /> <!-- 0x0403:0x6001 -->
+    <!-- Silicon Labs CP2102/CP2104 -->
+    <usb-device vendor-id="4292" product-id="60000" /> <!-- 0x10C4:0xEA60 -->
+    <!-- WCH CH340/CH341 -->
+    <usb-device vendor-id="6790" product-id="29987" /> <!-- 0x1A86:0x7523 -->
+    <!-- Prolific PL2303 -->
+    <usb-device vendor-id="1659" product-id="8963" /> <!-- 0x067B:0x2303 -->
+</resources>

@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+
+    <!-- Rover receiver plugs into the phone's USB-C port (OTG) directly -->
+    <uses-feature android:name="android.hardware.usb.host" android:required="true" />
+
+    <application
+        android:allowBackup="true"
+        android:label="GNSS Survey Console"
+        android:theme="@style/Theme.GnssConsole"
+        android:usesCleartextTraffic="true">
+        <!-- cleartext allowed: Base control talks to a plain-http server on the
+             site's own LAN (no TLS cert to manage in the field), never the public
+             internet. The rover no longer needs this server at all - see USB below. -->
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:windowSoftInputMode="adjustResize">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+            <!-- lets Android offer "open with GNSS Survey Console" when the rover
+                 receiver is plugged in, instead of only auto-detecting once already open -->
+            <intent-filter>
+                <action android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED" />
+            </intent-filter>
+            <meta-data
+                android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED"
+                android:resource="@xml/device_filter" />
+        </activity>
+    </application>
+</manifest>

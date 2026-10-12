@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: gnss-relay
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python3 server/app.py --host 0.0.0.0 --port $PORT
+    healthCheckPath: /
+    autoDeploy: true
