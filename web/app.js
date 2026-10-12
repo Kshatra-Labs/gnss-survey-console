@@ -5,7 +5,7 @@ const SERVER_KEY = "gnss_server_url";
 // works with zero typing for the common case. The backend behind this URL
 // is a pure byte relay (server/app.py's /ws/relay/{channel}) with no
 // USB/serial access of its own; all GNSS work happens in this browser.
-const DEFAULT_BACKEND = "https://harshill-2.tail14e3a.ts.net";
+const DEFAULT_BACKEND = "https://gnss-relay.onrender.com";
 
 let serverUrl = localStorage.getItem(SERVER_KEY) || DEFAULT_BACKEND;
 

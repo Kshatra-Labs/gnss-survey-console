@@ -33,7 +33,7 @@ private const val KEY_BACKEND_URL = "backend_url"
 // common case. The backend here is a pure byte relay with no USB/serial
 // access of its own; all GNSS work happens on-device (Base and Rover are
 // both local-USB-only now - there is no "remote base" mode).
-private const val DEFAULT_BACKEND = "https://harshill-2.tail14e3a.ts.net"
+private const val DEFAULT_BACKEND = "https://gnss-relay.onrender.com"
 private const val DEFAULT_CHANNEL = "default"
 
 class MainActivity : ComponentActivity() {
