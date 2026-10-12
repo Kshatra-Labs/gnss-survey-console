@@ -26,7 +26,7 @@ function setBadge(prefix, state, isError) {
 
 function renderPointResult(el, r) {
   if (r.cancelled) { el.innerHTML = "<i>cancelled</i>"; return; }
-  let text = `label: ${r.label}\nlat: ${r.lat_deg.toFixed(8)}\nlon: ${r.lon_deg.toFixed(8)}\nheight_msl_m: ${r.height_msl_m.toFixed(3)}\nepochs: ${r.n}  spread: ${r.spread_m.toFixed(3)}m  all_fixed: ${r.all_fixed}`;
+  let text = `label: ${r.label}\nlat: ${r.lat_deg.toFixed(8)}\nlon: ${r.lon_deg.toFixed(8)}\nheight_msl_m: ${r.height_msl_m.toFixed(3)}\nepochs: ${r.n}  spread: ${r.spread_m.toFixed(3)}m  fix=${r.all_fixed}  (fix=true means every collected epoch was RTK FIXED)`;
   if (r.origin_e !== undefined) {
     text += `\n\norigin_e: ${r.origin_e.toFixed(4)}\norigin_n: ${r.origin_n.toFixed(4)}\norigin_u: ${r.origin_u.toFixed(4)}`;
   }
@@ -54,6 +54,25 @@ function usbSetStatus(text, isErr) {
 }
 
 function usbSetBadge(state, isErr) { setBadge("usb", state, isErr); }
+
+/** Builds the multi-line "clearly labeled stats" block shown in every
+ * connected rover status - relay link health (bytes actually flowing, how
+ * long ago) and the receiver's own fix stats (FIX=true/false is the carrier
+ * solution reaching RTK FIXED, not just "has a position"). */
+function roverStatsBlock(bridge, pvt) {
+  const lines = [];
+  if (bridge) {
+    const s = bridge.stats();
+    const age = s.ageS === null ? "never" : `${s.ageS.toFixed(1)}s ago`;
+    lines.push(`relay: ${bridge.connected() ? "connected" : "reconnecting"}  bytes=${s.bytes}  last=${age}`);
+  }
+  if (pvt) {
+    lines.push(`FIX=${pvt.carrSoln === 2}  (${Ubx.CARR_SOLN[pvt.carrSoln] ?? "?"}, fixType=${Ubx.FIX_TYPE[pvt.fixType] ?? pvt.fixType})  sv=${pvt.numSv}  hAcc=${pvt.hAccM.toFixed(3)}m  vAcc=${pvt.vAccM.toFixed(3)}m`);
+  } else {
+    lines.push("FIX: no NAV-PVT received yet");
+  }
+  return lines.join("\n");
+}
 
 if (!("serial" in navigator)) {
   $("usbUnsupported").style.display = "block";
@@ -98,8 +117,7 @@ async function usbRunSession(mode) {
       usbSetBadge("streaming", false);
       while (!usbStopRequested) {
         const pvt = await usbConn.readNavPvt(3000);
-        if (!pvt) { usbSetStatus("...no fix yet"); continue; }
-        usbSetStatus(pvt.statusStr);
+        usbSetStatus(roverStatsBlock(usbCorrBridge, pvt));
       }
     } else {
       const label = $("usbLabel").value || "point";
@@ -108,12 +126,16 @@ async function usbRunSession(mode) {
       usbSetBadge("averaging", false);
       const lats = [], lons = [], heights = [];
       let allFixed = true;
+      let framesSeen = 0;
+      let bestCarrSoln = -1; // -1 = never saw a NAV-PVT at all
       const deadline = Date.now() + durationS * 1000;
       while (Date.now() < deadline && !usbStopRequested) {
         const remaining = Math.max(0, (deadline - Date.now()) / 1000);
         const pvt = await usbConn.readNavPvt(3000);
-        if (!pvt) { usbSetStatus(`[${remaining.toFixed(1)}s left] ...no fix yet`); continue; }
-        usbSetStatus(`[${remaining.toFixed(1)}s left] ${pvt.statusStr} collected=${lats.length}`);
+        usbSetStatus(`[${remaining.toFixed(1)}s left] collected=${lats.length}\n${roverStatsBlock(usbCorrBridge, pvt)}`);
+        if (!pvt) continue;
+        framesSeen++;
+        if (pvt.carrSoln > bestCarrSoln) bestCarrSoln = pvt.carrSoln;
         if (pvt.carrSoln !== 2) {
           allFixed = false;
           if (requireFixed) continue;
@@ -123,8 +145,17 @@ async function usbRunSession(mode) {
 
       if (usbStopRequested) {
         $("usbResult").innerHTML = "<i>cancelled</i>";
+      } else if (!lats.length && framesSeen === 0) {
+        usbSetStatus("no NAV-PVT messages received at all - receiver isn't talking UBX over this port " +
+          "(check baud/wiring; this is NOT a corrections problem, nothing GNSS-related was ever read)", true);
       } else if (!lats.length) {
-        usbSetStatus("no usable fixes collected - corrections never reached RTK FLOAT/FIXED", true);
+        const bridgeStats = usbCorrBridge ? usbCorrBridge.stats() : null;
+        const bytesNote = bridgeStats ? ` relay bytes received=${bridgeStats.bytes}` : "";
+        usbSetStatus(`received ${framesSeen} fixes but corrections never reached RTK FIXED ` +
+          `(best carrier solution seen: ${Ubx.CARR_SOLN[bestCarrSoln] ?? "none"}).${bytesNote} ` +
+          (bridgeStats && bridgeStats.bytes === 0
+            ? "Zero correction bytes arrived from the relay - check the Base is actually broadcasting and both sides use the same relay channel."
+            : "Correction bytes are arriving but the fix never upgraded - check baseline distance and that the Base's own position is valid."), true);
       } else {
         const meanLat = lats.reduce((a, b) => a + b, 0) / lats.length;
         const meanLon = lons.reduce((a, b) => a + b, 0) / lons.length;
@@ -172,6 +203,7 @@ $("usbStop").onclick = () => { usbStopRequested = true; };
 let baseUsbConn = null;
 let baseUsbUpload = null;
 let baseUsbStopRequested = false;
+let baseUsbStatsTimer = null;
 
 function baseUsbSetStatus(text, isErr) {
   const el = $("baseUsbStatus");
@@ -233,8 +265,18 @@ $("baseUsbStart").onclick = async () => {
 
     const channel = $("baseUsbChannel").value.trim() || "default";
     baseUsbSetBadge("broadcasting", false);
-    baseUsbSetStatus(`broadcasting on relay channel "${channel}" - meanAcc=${svin.meanAccM.toFixed(3)}m`);
     baseUsbUpload = startRelayUpload(serverUrl || location.origin, channel, baseUsbConn, (m) => baseUsbSetStatus(m));
+
+    const svinFinal = svin;
+    baseUsbStatsTimer = setInterval(() => {
+      if (!baseUsbUpload) return;
+      const s = baseUsbUpload.stats();
+      const age = s.ageS === null ? "never" : `${s.ageS.toFixed(1)}s ago`;
+      baseUsbSetStatus(
+        `broadcasting on relay channel "${channel}"  meanAcc=${svinFinal.meanAccM.toFixed(3)}m\n` +
+        `relay: ${baseUsbUpload.connected() ? "connected" : "reconnecting"}  bytes sent=${s.bytes}  last=${age}`
+      );
+    }, 2000);
   } catch (e) {
     baseUsbSetStatus("ERROR: " + e.message, true);
   } finally {
@@ -248,6 +290,7 @@ $("baseUsbStart").onclick = async () => {
 
 $("baseUsbStop").onclick = () => {
   baseUsbStopRequested = true;
+  if (baseUsbStatsTimer) { clearInterval(baseUsbStatsTimer); baseUsbStatsTimer = null; }
   if (baseUsbUpload) { baseUsbUpload.stop(); baseUsbUpload = null; }
   baseUsbSetBadge(null, false);
   baseUsbSetStatus("stopped");

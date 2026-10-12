@@ -51,6 +51,28 @@ class LocalRoverController {
         stopRequested = true
     }
 
+    /** Multi-line "clearly labeled stats" block shown everywhere this rover
+     * is connected - relay link health (bytes actually flowing, how long
+     * ago) and the receiver's own fix stats. FIX=true means the carrier
+     * solution reached RTK FIXED, not just "has some position". */
+    private fun statsBlock(download: RelayClient.Download?, pvt: Ubx.NavPvt?): String {
+        val lines = ArrayList<String>()
+        if (download != null) {
+            val s = download.stats()
+            val age = if (s.ageS == null) "never" else "%.1fs ago".format(s.ageS)
+            lines.add("relay: ${if (download.connected()) "connected" else "reconnecting"}  bytes=${s.bytes}  last=$age")
+        }
+        if (pvt != null) {
+            lines.add(
+                "FIX=${pvt.carrSoln == 2}  (${Ubx.CARR_SOLN[pvt.carrSoln] ?: "?"}, fixType=${Ubx.FIX_TYPE[pvt.fixType] ?: pvt.fixType})  " +
+                    "sv=${pvt.numSv}  hAcc=${"%.3f".format(pvt.hAccM)}m  vAcc=${"%.3f".format(pvt.vAccM)}m"
+            )
+        } else {
+            lines.add("FIX: no NAV-PVT received yet")
+        }
+        return lines.joinToString("\n")
+    }
+
     /** mode: "monitor" streams live status only; "point" also averages
      * `durationS` seconds of fixes into a PointResult. */
     private fun run(
@@ -89,8 +111,7 @@ class LocalRoverController {
                 setStatus("streaming")
                 while (!stopRequested) {
                     val pvt = conn.readNavPvt(3000)
-                    if (pvt == null) { setStatus("...no fix yet"); continue }
-                    setStatus(pvt.statusStr)
+                    setStatus(statsBlock(download, pvt))
                 }
                 result = PointResult(label, 0.0, 0.0, 0.0, 0, 0.0, false, cancelled = true)
             } else {
@@ -99,12 +120,16 @@ class LocalRoverController {
                 val lons = ArrayList<Double>()
                 val heights = ArrayList<Double>()
                 var allFixed = true
+                var framesSeen = 0
+                var bestCarrSoln = -1 // -1 = never saw a NAV-PVT at all
                 val deadline = System.nanoTime() + (durationS * 1e9).toLong()
                 while (System.nanoTime() < deadline && !stopRequested) {
                     val remainingS = max(0.0, (deadline - System.nanoTime()) / 1e9)
                     val pvt = conn.readNavPvt(3000)
-                    if (pvt == null) { setStatus("[%.1fs left] ...no fix yet".format(remainingS)); continue }
-                    setStatus("[%.1fs left] %s sv=%d collected=%d".format(remainingS, pvt.statusStr, pvt.numSv, lats.size))
+                    setStatus("[%.1fs left] collected=%d\n%s".format(remainingS, lats.size, statsBlock(download, pvt)))
+                    if (pvt == null) continue
+                    framesSeen++
+                    if (pvt.carrSoln > bestCarrSoln) bestCarrSoln = pvt.carrSoln
                     if (pvt.carrSoln != 2) {
                         allFixed = false
                         if (requireFixed) continue
@@ -116,8 +141,22 @@ class LocalRoverController {
 
                 if (stopRequested) {
                     result = PointResult(label, 0.0, 0.0, 0.0, 0, 0.0, false, cancelled = true)
+                } else if (lats.isEmpty() && framesSeen == 0) {
+                    throw IllegalStateException(
+                        "no NAV-PVT messages received at all - receiver isn't talking UBX over this port " +
+                            "(check baud/wiring; this is NOT a corrections problem, nothing GNSS-related was ever read)"
+                    )
                 } else if (lats.isEmpty()) {
-                    throw IllegalStateException("no usable fixes collected - corrections never reached RTK FLOAT/FIXED")
+                    val s = download.stats()
+                    val bytesNote = " relay bytes received=${s.bytes}"
+                    val cause = if (s.bytes == 0L)
+                        "Zero correction bytes arrived from the relay - check the Base is actually broadcasting and both sides use the same relay channel."
+                    else
+                        "Correction bytes are arriving but the fix never upgraded - check baseline distance and that the Base's own position is valid."
+                    throw IllegalStateException(
+                        "received $framesSeen fixes but corrections never reached RTK FIXED " +
+                            "(best carrier solution seen: ${Ubx.CARR_SOLN[bestCarrSoln] ?: "none"}).$bytesNote $cause"
+                    )
                 } else {
                     val meanLat = lats.average()
                     val meanLon = lons.average()

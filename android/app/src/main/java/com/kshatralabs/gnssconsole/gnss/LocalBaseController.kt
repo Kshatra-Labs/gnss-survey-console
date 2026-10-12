@@ -73,7 +73,7 @@ class LocalBaseController {
 
                 setStatus("connecting to relay...")
                 upload = RelayClient.startUpload(backendUrl, channel) { setStatus(it) }
-                setStatus("broadcasting on relay channel \"$channel\" - meanAcc=${"%.3f".format(svin?.meanAccM ?: 0.0)}m")
+                val meanAcc = svin?.meanAccM ?: 0.0
 
                 // Post-survey-in: stop polling for UBX messages entirely and
                 // forward raw bytes (RTCM3, not UBX-framed) straight to the
@@ -81,9 +81,20 @@ class LocalBaseController {
                 // cmd_base uses.
                 val buf = ByteArray(4096)
                 val u = upload
+                var lastStatusAt = 0L
                 while (!stopRequested) {
                     val n = conn.readRawInto(buf, 1000)
                     if (n > 0) u.feed(buf, n)
+                    val now = System.currentTimeMillis()
+                    if (now - lastStatusAt > 2000) {
+                        lastStatusAt = now
+                        val s = u.stats()
+                        val age = if (s.ageS == null) "never" else "%.1fs ago".format(s.ageS)
+                        setStatus(
+                            "broadcasting on relay channel \"$channel\"  meanAcc=${"%.3f".format(meanAcc)}m\n" +
+                                "relay: ${if (u.connected()) "connected" else "reconnecting"}  bytes sent=${s.bytes}  last=$age"
+                        )
+                    }
                 }
             } catch (e: Exception) {
                 if (statusText.startsWith("requesting") || statusText.startsWith("opening")) {

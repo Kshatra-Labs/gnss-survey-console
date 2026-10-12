@@ -57,8 +57,16 @@ class SerialGnssConnection {
   /** Switches this connection into raw-passthrough mode: every subsequent
    * incoming chunk goes straight to `sink(Uint8Array)`, no UBX parsing.
    * One-way - matches how the base role never needs to read UBX again once
-   * it starts broadcasting. */
-  enableRawMode(sink) { this._rawSink = sink; }
+   * it starts broadcasting. Flushes whatever's still sitting in the UBX
+   * frame buffer first (e.g. a trailing NAV-SVIN fragment) so no bytes are
+   * silently dropped at the handoff boundary. */
+  enableRawMode(sink) {
+    if (this._buf.length) {
+      sink(new Uint8Array(this._buf));
+      this._buf = [];
+    }
+    this._rawSink = sink;
+  }
 
   _drain() {
     while (true) {
@@ -231,6 +239,29 @@ function relayWsUrl(backendUrl, channel, role) {
   return `${base}/ws/relay/${encodeURIComponent(channel)}?role=${role}`;
 }
 
+/** Free-tier relay hosts (Render) spin down after ~15min idle; the request
+ * that wakes them back up can take 30-60s, and a WebSocket upgrade is a
+ * flaky way to ride that out. Fire a plain GET in parallel with the actual
+ * WS connect attempt so a sleeping backend is already waking up (or awake)
+ * by the time the retry loop's 3s backoff comes back around. Best-effort -
+ * errors here are expected and ignored. */
+function warmUp(backendUrl) {
+  try {
+    const url = (backendUrl || location.origin).replace(/\/$/, "") + "/";
+    fetch(url, { cache: "no-store", mode: "cors" }).catch(() => {});
+  } catch (e) { /* ignore */ }
+}
+
+/** Live counters for a relay link, surfaced so the UI can show something
+ * more concrete than "connected" - bytes actually flowing, and how long
+ * ago the last one arrived (the fastest way to tell "corrections aren't
+ * coming through" apart from "corrections are coming through but the
+ * receiver still isn't fixing"). */
+function relayStats(stats) {
+  const ageS = stats.lastAt ? (Date.now() - stats.lastAt) / 1000 : null;
+  return { bytes: stats.bytes, ageS };
+}
+
 /** Base side: uploads whatever bytes come out of `conn` (once it's in raw
  * mode, post-survey-in) to the cloud relay's /ws/relay/<channel>?role=base.
  * This is the piece that makes Base "run on the cloud" in the only sense
@@ -240,9 +271,11 @@ function startRelayUpload(backendUrl, channel, conn, onStatus) {
   let stopped = false;
   let ws = null;
   let queue = [];
+  const stats = { bytes: 0, lastAt: 0 };
 
   function connect() {
     if (stopped) return;
+    warmUp(backendUrl);
     ws = new WebSocket(relayWsUrl(backendUrl, channel, "base"));
     ws.binaryType = "arraybuffer";
     ws.onopen = () => {
@@ -262,11 +295,17 @@ function startRelayUpload(backendUrl, channel, conn, onStatus) {
 
   conn.enableRawMode((chunk) => {
     const copy = chunk.slice(); // own copy - the Uint8Array view may be reused by the reader
+    stats.bytes += copy.length;
+    stats.lastAt = Date.now();
     if (ws && ws.readyState === WebSocket.OPEN) ws.send(copy);
     else queue.push(copy);
   });
 
-  return { stop: () => { stopped = true; try { ws && ws.close(); } catch (e) {} } };
+  return {
+    stop: () => { stopped = true; try { ws && ws.close(); } catch (e) {} },
+    stats: () => relayStats(stats),
+    connected: () => !!ws && ws.readyState === WebSocket.OPEN,
+  };
 }
 
 /** Rover side: pulls bytes from the cloud relay's /ws/relay/<channel> and
@@ -274,13 +313,20 @@ function startRelayUpload(backendUrl, channel, conn, onStatus) {
 function startRelayDownload(backendUrl, channel, conn, onStatus) {
   let stopped = false;
   let ws = null;
+  const stats = { bytes: 0, lastAt: 0 };
 
   function connect() {
     if (stopped) return;
+    warmUp(backendUrl);
     ws = new WebSocket(relayWsUrl(backendUrl, channel, "rover"));
     ws.binaryType = "arraybuffer";
     ws.onopen = () => onStatus(`relay: receiving corrections on channel "${channel}"`);
-    ws.onmessage = (ev) => { conn.writeBytes(new Uint8Array(ev.data)).catch(() => {}); };
+    ws.onmessage = (ev) => {
+      const bytes = new Uint8Array(ev.data);
+      stats.bytes += bytes.length;
+      stats.lastAt = Date.now();
+      conn.writeBytes(bytes).catch(() => {});
+    };
     ws.onclose = () => {
       if (!stopped) {
         onStatus("relay: corrections link dropped, reconnecting");
@@ -291,7 +337,11 @@ function startRelayDownload(backendUrl, channel, conn, onStatus) {
   }
   connect();
 
-  return { stop: () => { stopped = true; try { ws && ws.close(); } catch (e) {} } };
+  return {
+    stop: () => { stopped = true; try { ws && ws.close(); } catch (e) {} },
+    stats: () => relayStats(stats),
+    connected: () => !!ws && ws.readyState === WebSocket.OPEN,
+  };
 }
 
 if (typeof window !== "undefined") {

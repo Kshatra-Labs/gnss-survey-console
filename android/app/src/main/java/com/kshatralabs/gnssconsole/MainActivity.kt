@@ -432,7 +432,7 @@ private fun PointResultView(r: PointResult) {
             Text("lat: ${r.latDeg}", fontSize = 12.sp)
             Text("lon: ${r.lonDeg}", fontSize = 12.sp)
             Text("height_msl_m: ${r.heightMslM}", fontSize = 12.sp)
-            Text("epochs: ${r.n}  spread: ${"%.3f".format(r.spreadM)}m  all_fixed: ${r.allFixed}", fontSize = 12.sp)
+            Text("epochs: ${r.n}  spread: ${"%.3f".format(r.spreadM)}m  fix=${r.allFixed}  (fix=true means every collected epoch was RTK FIXED)", fontSize = 12.sp)
             if (r.originE != null) {
                 Spacer(Modifier.height(4.dp))
                 Text("origin_e: ${"%.4f".format(r.originE)}", fontSize = 12.sp)
