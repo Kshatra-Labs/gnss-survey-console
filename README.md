@@ -30,29 +30,43 @@ One link to remember: **https://kshatra-labs.github.io/gnss-survey-console/**
   and connecting a USB receiver is the entire setup. Requires Chrome or
   Edge (Web Serial API) - not Firefox or Safari.
 
-## Run the relay yourself (optional - the hosted one above already works)
+## The relay, and where it runs
 
-```bash
-cd ~/KshatraLabs/GNSS_Survey_Console
-pip install --user --break-system-packages -r requirements.txt   # first time only
-python3 server/app.py --host 0.0.0.0 --port 8765
-```
+The backend (`server/app.py`) does two things only: serves the static page,
+and relays RTCM3 bytes between whichever browser/app has "base" open on a
+channel and whichever has "rover" open on the same channel. It never
+touches a serial port - that's deliberate, and it's why this piece (unlike
+an actual GPS receiver) can run on ordinary free cloud compute instead of
+needing to be near the hardware.
 
-This process does two things only: serves the static page, and relays
-RTCM3 bytes between whichever browser/app has "base" open on a channel and
-whichever has "rover" open on the same channel. It never touches a serial
-port - that's deliberate, and it's why this piece (unlike an actual GPS
-receiver) could run on ordinary free cloud compute instead of needing to be
-near the hardware.
+It's pushed to its own repo, **https://github.com/Kshatra-Labs/gnss-relay**
+(private), with a `render.yaml` blueprint so [Render](https://render.com)'s
+free tier can deploy it with no credit card. To stand it up:
 
-This machine runs it as a systemd user service (`gnss-backend.service`,
-auto-restarts on crash) and exposes it permanently via
-[Tailscale Funnel](https://tailscale.com/kb/1223/funnel):
+1. Go to **https://dashboard.render.com/blueprints** (sign in with GitHub -
+   first time only), click **New Blueprint Instance**, pick the
+   `Kshatra-Labs/gnss-relay` repo. Render reads `render.yaml` and creates
+   the free web service automatically - nothing to configure.
+2. Once it deploys, copy the `https://<something>.onrender.com` URL Render
+   gives it, and put that in `DEFAULT_BACKEND` in `web/app.js` and
+   `MainActivity.kt` (and in the **Cloud relay** field on the page/app for
+   anyone already using the old address), then push/rebuild.
+
+Free-tier tradeoff: Render spins the service down after ~15 minutes idle
+and takes 30-60s to wake on the next connection - fine here, since nothing
+survey-related happens instantly anyway, and both the web page and the
+Android app already auto-reconnect with a short backoff. If that cold
+start ever becomes annoying, a free
+[cron-job.org](https://cron-job.org) ping every 10 minutes keeps it warm.
+
+Until that one-time Render setup is done, this machine keeps running it as
+a systemd user service (`gnss-backend.service`, auto-restarts on crash),
+exposed via [Tailscale Funnel](https://tailscale.com/kb/1223/funnel):
 
 **`https://harshill-2.tail14e3a.ts.net`**
 
-That's the default the page and the Android app are both pre-filled with.
-Point it elsewhere only if you're running your own relay.
+That's the current default the page and the Android app are pre-filled
+with. Point it elsewhere only if you're running your own relay.
 
 **No authentication** on the relay - anyone with its address can push bytes
 onto a channel, so don't use a guessable channel name if that matters to
@@ -104,9 +118,7 @@ in a browser, or vice versa. See `android/README.md` to build and run it.
 
 ## Possible next step
 
-The relay (`/ws/relay/{channel}` in `server/app.py`) has zero USB/serial
-dependency, so it's a genuine candidate for deployment to real free cloud
-compute (Render, Fly.io, a Cloudflare Worker, ...) instead of staying on a
-machine near the GPS hardware - it's about 40 lines of FastAPI with no
-external state. Worth doing if you want the relay's uptime decoupled from
-this specific machine entirely.
+Finish the one manual step above (click through Render's blueprint page
+for `Kshatra-Labs/gnss-relay` and update `DEFAULT_BACKEND`) to fully
+decouple the relay's uptime from this machine. I can't complete that sign-in
+step myself - it needs your GitHub-authenticated browser session.
