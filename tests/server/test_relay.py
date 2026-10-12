@@ -91,7 +91,9 @@ async def run(base: str, local: bool) -> None:
             s = await wait_status(base, ch, lambda s: s["bases"] == 2)
             assert s["bases"] == 2, s
             print("ok  two bases: only the newest is relayed, status reports the conflict")
-        await asyncio.sleep(0.3)
+        # over the internet the close takes a moment to reach the server
+        s = await wait_status(base, ch, lambda s: s["bases"] == 1)
+        assert s["bases"] == 1, s
         await b.send(b"old-base-again")
         assert await recv_n(r1, 1) == [b"old-base-again"]
         print("ok  when the newer base leaves, the remaining one is relayed again")
