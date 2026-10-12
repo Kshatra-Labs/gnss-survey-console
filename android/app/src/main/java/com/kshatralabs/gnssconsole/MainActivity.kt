@@ -1,9 +1,14 @@
 package com.kshatralabs.gnssconsole
 
+import android.content.BroadcastReceiver
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
+import android.hardware.usb.UsbManager
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.activity.viewModels
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
@@ -11,39 +16,84 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalView
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.content.ContextCompat
+import androidx.lifecycle.ViewModel
 import com.kshatralabs.gnssconsole.gnss.LocalBaseController
 import com.kshatralabs.gnssconsole.gnss.LocalRoverController
 import com.kshatralabs.gnssconsole.gnss.Origin
 import com.kshatralabs.gnssconsole.gnss.PointResult
+import com.kshatralabs.gnssconsole.gnss.RelayClient
 import com.kshatralabs.gnssconsole.gnss.UsbPortRef
 import com.kshatralabs.gnssconsole.gnss.UsbRover
+import com.kshatralabs.gnssconsole.gnss.fmt
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.withContext
 
 private const val PREFS = "gnss_console_prefs"
 private const val KEY_BACKEND_URL = "backend_url"
 
-// This project's own known-stable relay address (matches web/app.js's
-// DEFAULT_BACKEND) - autofilled so the app works with zero typing for the
-// common case. The backend here is a pure byte relay with no USB/serial
-// access of its own; all GNSS work happens on-device (Base and Rover are
-// both local-USB-only now - there is no "remote base" mode).
+// Same default relay as web/app.js. It only forwards RTCM3 bytes; all GNSS
+// work happens on whichever device has the receiver plugged in.
 private const val DEFAULT_BACKEND = "https://gnss-relay.onrender.com"
 private const val DEFAULT_CHANNEL = "default"
 
+/** Survives rotation, so a running session is never orphaned. */
+class ConsoleViewModel : ViewModel() {
+    val base = LocalBaseController()
+    val point = LocalRoverController("Rover point survey", preemptible = false)
+    val monitor = LocalRoverController("Rover live monitor", preemptible = true)
+    var channel by mutableStateOf(DEFAULT_CHANNEL)
+    var originLat by mutableStateOf("")
+    var originLon by mutableStateOf("")
+    var originAlt by mutableStateOf("")
+    var usbTick by mutableIntStateOf(0)
+
+    override fun onCleared() {
+        base.stop(); point.stop(); monitor.stop()
+    }
+}
+
 class MainActivity : ComponentActivity() {
+    private val vm: ConsoleViewModel by viewModels()
+
+    private val usbReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) { vm.usbTick++ }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        val filter = IntentFilter().apply {
+            addAction(UsbManager.ACTION_USB_DEVICE_ATTACHED)
+            addAction(UsbManager.ACTION_USB_DEVICE_DETACHED)
+        }
+        ContextCompat.registerReceiver(this, usbReceiver, filter, ContextCompat.RECEIVER_NOT_EXPORTED)
         setContent {
             MaterialTheme {
-                Surface(modifier = Modifier.fillMaxSize()) { GnssConsoleApp() }
+                Surface(modifier = Modifier.fillMaxSize()) { GnssConsoleApp(vm) }
             }
         }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        vm.usbTick++ // launched again by a USB_DEVICE_ATTACHED intent
+    }
+
+    override fun onDestroy() {
+        unregisterReceiver(usbReceiver)
+        super.onDestroy()
     }
 }
 
@@ -54,34 +104,31 @@ private fun saveBackendUrl(ctx: Context, url: String) {
     ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putString(KEY_BACKEND_URL, url).apply()
 }
 
-@Composable
-fun GnssConsoleApp() {
-    val ctx = LocalContext.current
+private val Good = Color(0xFF2E9E55)
+private val Warn = Color(0xFFC98A1B)
+private val Bad = Color(0xFFD0453A)
 
+@Composable
+fun GnssConsoleApp(vm: ConsoleViewModel) {
+    val ctx = LocalContext.current
     var backendUrl by remember { mutableStateOf(loadBackendUrl(ctx)) }
 
-    // USB devices: anything plugged into THIS phone's USB-C/OTG port.
     var usbPorts by remember { mutableStateOf(listOf<UsbPortRef>()) }
-    var usbRawCount by remember { mutableStateOf(0) }
+    var usbRawCount by remember { mutableIntStateOf(0) }
     fun refreshUsbPorts() {
         val scan = UsbRover.scan(ctx)
         usbPorts = scan.candidates
         usbRawCount = scan.rawDeviceCount
     }
-    LaunchedEffect(Unit) { refreshUsbPorts() }
+    LaunchedEffect(vm.usbTick) { refreshUsbPorts() }
 
-    val baseController = remember { LocalBaseController() }
-    val pointController = remember { LocalRoverController() }
-    val roverController = remember { LocalRoverController() }
-
-    // Shared relay channel: Base broadcasts on it, Rover/monitor listen on
-    // it - autofilled to the same default everywhere so nothing needs
-    // typing unless you're running more than one base/rover pair at once.
-    var relayChannel by remember { mutableStateOf(DEFAULT_CHANNEL) }
-
-    var originLat by remember { mutableStateOf("") }
-    var originLon by remember { mutableStateOf("") }
-    var originAlt by remember { mutableStateOf("") }
+    // Screen (and with it USB + network) stays on while anything runs.
+    val view = LocalView.current
+    val anyRunning = vm.base.running || vm.point.running || vm.monitor.running
+    DisposableEffect(anyRunning) {
+        view.keepScreenOn = anyRunning
+        onDispose { }
+    }
 
     Column(
         modifier = Modifier
@@ -91,13 +138,10 @@ fun GnssConsoleApp() {
     ) {
         Text("GNSS Survey Console", fontSize = 20.sp, fontWeight = FontWeight.Bold)
         Text(
-            "u-blox F9P RTK survey. Base and Rover both plug into this phone directly.",
+            "u-blox F9P RTK survey. Base and Rover plug into phones directly; corrections go through the cloud relay.",
             fontSize = 13.sp, color = MaterialTheme.colorScheme.onSurfaceVariant
         )
         Spacer(Modifier.height(12.dp))
-
-        IntroCard()
-        Spacer(Modifier.height(16.dp))
 
         RelayCard(backendUrl = backendUrl, onBackendUrlChange = { backendUrl = it; saveBackendUrl(ctx, it) })
         Spacer(Modifier.height(16.dp))
@@ -105,82 +149,44 @@ fun GnssConsoleApp() {
         UsbPortsCard(ports = usbPorts, rawCount = usbRawCount, onRescan = { refreshUsbPorts() })
         Spacer(Modifier.height(16.dp))
 
-        BaseCard(
-            controller = baseController, ports = usbPorts, context = ctx,
-            backendUrl = backendUrl, channel = relayChannel, onChannelChange = { relayChannel = it },
-        )
+        BaseCard(vm, vm.base, usbPorts, ctx, backendUrl)
         Spacer(Modifier.height(16.dp))
 
-        PointCard(
-            controller = pointController, ports = usbPorts, context = ctx,
-            backendUrl = backendUrl, channel = relayChannel, onChannelChange = { relayChannel = it },
-            originLat = originLat, originLon = originLon, originAlt = originAlt,
-            onOriginFilled = { lat, lon, alt -> originLat = lat; originLon = lon; originAlt = alt },
-        )
+        PointCard(vm, vm.point, usbPorts, ctx, backendUrl)
         Spacer(Modifier.height(16.dp))
 
-        RoverMonitorCard(
-            controller = roverController, ports = usbPorts, context = ctx,
-            backendUrl = backendUrl, channel = relayChannel, onChannelChange = { relayChannel = it },
-        )
+        RoverMonitorCard(vm, vm.monitor, usbPorts, ctx, backendUrl)
         Spacer(Modifier.height(24.dp))
     }
 }
 
 @Composable
-private fun IntroCard() {
-    ElevatedCard(modifier = Modifier.fillMaxWidth()) {
-        Column(Modifier.padding(14.dp)) {
-            Text(
-                "A single GPS is accurate to a few metres. Two GPS units working " +
-                    "together as RTK - one fixed, one carried around - are accurate " +
-                    "to a couple of centimetres.",
-                fontSize = 13.sp
-            )
-            Spacer(Modifier.height(8.dp))
-            Text("BASE", fontWeight = FontWeight.Bold, fontSize = 12.sp, color = MaterialTheme.colorScheme.primary)
-            Text(
-                "Plugs into this phone's USB-C port. Works out its own position " +
-                    "precisely, then uploads corrections to the cloud relay below.",
-                fontSize = 12.5.sp
-            )
-            Spacer(Modifier.height(6.dp))
-            Text("ROVER", fontWeight = FontWeight.Bold, fontSize = 12.sp, color = MaterialTheme.colorScheme.primary)
-            Text(
-                "Also plugs into a USB port (this phone, with a hub, or a different " +
-                    "phone). Pulls corrections from the same relay channel and gives " +
-                    "you a centimetre-accurate reading of wherever it currently is.",
-                fontSize = 12.5.sp
-            )
-            Spacer(Modifier.height(6.dp))
-            Text(
-                "Note: the relay only forwards bytes - it has no USB/GPS access of " +
-                    "its own, so all the actual GNSS work happens on whichever device " +
-                    "has a receiver plugged in, here or in a browser.",
-                fontSize = 11.5.sp, color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
-        }
-    }
-}
-
-@Composable
 private fun RelayCard(backendUrl: String, onBackendUrlChange: (String) -> Unit) {
+    var health by remember { mutableStateOf("checking relay...") }
+    var healthOk by remember { mutableStateOf<Boolean?>(null) }
+    var recheck by remember { mutableIntStateOf(0) }
+    LaunchedEffect(backendUrl, recheck) {
+        delay(700) // let typing settle
+        health = "checking relay... (a sleeping free-tier relay can take up to a minute to wake)"
+        healthOk = null
+        val (ok, text) = withContext(Dispatchers.IO) { RelayClient.health(backendUrl) }
+        healthOk = ok
+        health = text
+    }
     ElevatedCard(modifier = Modifier.fillMaxWidth()) {
         Column(Modifier.padding(14.dp)) {
             Text("Cloud relay", fontWeight = FontWeight.Bold)
             Text(
-                "Where Base and Rover find each other. Auto-filled with this " +
-                    "project's known address - only change it if you're running your own relay.",
+                "Where Base and Rover find each other. Pre-filled - only change it if you run your own relay.",
                 fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant
             )
             Spacer(Modifier.height(8.dp))
             OutlinedTextField(
-                value = backendUrl,
-                onValueChange = onBackendUrlChange,
-                label = { Text("https://your-relay-address") },
-                singleLine = true,
-                modifier = Modifier.fillMaxWidth(),
+                value = backendUrl, onValueChange = onBackendUrlChange,
+                label = { Text("relay address") }, singleLine = true, modifier = Modifier.fillMaxWidth(),
             )
+            TextButton(onClick = { recheck++ }) { Text("Test relay") }
+            StatusBox(health, isError = healthOk == false)
         }
     }
 }
@@ -191,51 +197,51 @@ private fun UsbPortsCard(ports: List<UsbPortRef>, rawCount: Int, onRescan: () ->
         Column(Modifier.padding(14.dp)) {
             Text("USB devices", fontWeight = FontWeight.Bold)
             Text(
-                "Plug receivers into this phone with a USB-C OTG adapter/cable (a hub for more than one), then rescan.",
+                "Plug receivers in with a USB-C OTG adapter (a hub for two). The list refreshes itself on plug/unplug.",
                 fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant
             )
-            Spacer(Modifier.height(8.dp))
-            Button(onClick = onRescan, modifier = Modifier.padding(top = 0.dp)) { Text("Rescan USB devices") }
-            Spacer(Modifier.height(8.dp))
+            Button(onClick = onRescan, modifier = Modifier.padding(top = 6.dp)) { Text("Rescan USB devices") }
+            Spacer(Modifier.height(6.dp))
             val emptyMsg = when {
                 ports.isNotEmpty() -> null
-                rawCount == 0 -> "(nothing detected - Android sees no USB device at all. Try a different OTG " +
-                    "cable/adapter, or check the phone actually supports USB host/OTG mode.)"
-                else -> "($rawCount USB device(s) detected, but none matched a known serial chip. " +
-                    "Check res/xml/device_filter.xml has its vendor/product ID.)"
+                rawCount == 0 -> "(nothing detected - Android sees no USB device at all. Try another OTG " +
+                    "cable/adapter, or check the phone supports USB host/OTG.)"
+                else -> "($rawCount USB device(s) detected, but none is a known serial chip.)"
             }
-            Text(
-                emptyMsg ?: ports.joinToString("\n") { it.label },
-                fontSize = 12.sp,
-            )
+            Text(emptyMsg ?: ports.joinToString("\n") { it.label }, fontSize = 12.sp)
         }
     }
 }
 
-// NOTE: putting .clickable{} directly on a readOnly OutlinedTextField is a
-// well-known Compose trap - the text field consumes the tap for its own
-// focus/cursor handling first, so the click often never fires. The fix is
-// an invisible Box overlaid on top of the field that intercepts the tap
-// before the field gets it.
+// .clickable{} on a readOnly OutlinedTextField is swallowed by the field's
+// own focus handling, so an invisible Box on top takes the tap instead.
 @Composable
-private fun UsbPortDropdown(label: String, ports: List<UsbPortRef>, selected: UsbPortRef?, onSelect: (UsbPortRef) -> Unit) {
+private fun UsbPortDropdown(label: String, ports: List<UsbPortRef>, selected: UsbPortRef?, enabled: Boolean, onSelect: (UsbPortRef) -> Unit) {
     var expanded by remember { mutableStateOf(false) }
     Box(modifier = Modifier.fillMaxWidth()) {
         OutlinedTextField(
-            value = selected?.label ?: "(select)",
-            onValueChange = {}, readOnly = true, label = { Text(label) },
+            value = selected?.label ?: "(none - plug one in)",
+            onValueChange = {}, readOnly = true, label = { Text(label) }, enabled = enabled,
             modifier = Modifier.fillMaxWidth(),
         )
-        Box(
-            modifier = Modifier
-                .matchParentSize()
-                .clickable { expanded = true },
-        )
+        Box(modifier = Modifier.matchParentSize().clickable(enabled = enabled) { expanded = true })
         DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
-            if (ports.isEmpty()) DropdownMenuItem(text = { Text("none - rescan above") }, onClick = { expanded = false })
+            if (ports.isEmpty()) DropdownMenuItem(text = { Text("none - plug one in") }, onClick = { expanded = false })
             for (p in ports) DropdownMenuItem(text = { Text(p.label) }, onClick = { onSelect(p); expanded = false })
         }
     }
+}
+
+/** Keeps a selection across rescans (matched by device), falling back to a default. */
+@Composable
+private fun rememberPortSelection(ports: List<UsbPortRef>, preferIndex: Int): MutableState<UsbPortRef?> {
+    val sel = remember { mutableStateOf<UsbPortRef?>(null) }
+    LaunchedEffect(ports) {
+        val cur = sel.value
+        sel.value = ports.firstOrNull { it.key == cur?.key }
+            ?: ports.getOrNull(preferIndex) ?: ports.firstOrNull()
+    }
+    return sel
 }
 
 @Composable
@@ -246,213 +252,197 @@ private fun StatusBox(text: String, isError: Boolean) {
         modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
     ) {
         Text(
-            text, modifier = Modifier.padding(10.dp), fontSize = 12.sp,
+            text, modifier = Modifier.padding(10.dp), fontSize = 11.5.sp, fontFamily = FontFamily.Monospace,
             color = if (isError) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant,
         )
     }
 }
 
 @Composable
-private fun NumberRow(
-    label1: String, value1: String, onChange1: (String) -> Unit,
-    label2: String, value2: String, onChange2: (String) -> Unit,
-) {
-    Row(Modifier.fillMaxWidth().padding(top = 6.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-        OutlinedTextField(
-            value = value1, onValueChange = onChange1, label = { Text(label1) },
-            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-            singleLine = true, modifier = Modifier.weight(1f),
-        )
-        OutlinedTextField(
-            value = value2, onValueChange = onChange2, label = { Text(label2) },
-            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-            singleLine = true, modifier = Modifier.weight(1f),
-        )
+private fun Badge(text: String?, color: Color) {
+    if (text == null) return
+    Text(text, color = color, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+}
+
+@Composable
+private fun TitleRow(title: String, badge: String?, badgeColor: Color) {
+    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+        Text(title, fontWeight = FontWeight.Bold)
+        Badge(badge, badgeColor)
     }
 }
 
+private fun fixColor(badge: String?): Color = when {
+    badge == null -> Color.Unspecified
+    badge.contains("FIXED") -> Good
+    badge.contains("FLOAT") -> Warn
+    else -> Bad
+}
+
 @Composable
-private fun BaudField(baud: String, onChange: (String) -> Unit) {
+private fun NumberField(label: String, value: String, enabled: Boolean, modifier: Modifier = Modifier, onChange: (String) -> Unit) {
     OutlinedTextField(
-        value = baud, onValueChange = onChange, label = { Text("Baud") },
-        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+        value = value, onValueChange = onChange, label = { Text(label) }, enabled = enabled,
+        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+        singleLine = true, modifier = modifier,
+    )
+}
+
+@Composable
+private fun ChannelField(vm: ConsoleViewModel, enabled: Boolean) {
+    OutlinedTextField(
+        value = vm.channel, onValueChange = { vm.channel = it.trim() }, enabled = enabled,
+        label = { Text("Relay channel (same on Base and Rover)") },
         singleLine = true, modifier = Modifier.fillMaxWidth().padding(top = 6.dp),
     )
 }
 
 @Composable
-private fun RelayChannelField(channel: String, onChannelChange: (String) -> Unit) {
-    OutlinedTextField(
-        value = channel, onValueChange = onChannelChange,
-        label = { Text("Relay channel (must match on Base and Rover)") },
-        singleLine = true, modifier = Modifier.fillMaxWidth().padding(top = 6.dp),
-    )
-}
+private fun BaseCard(vm: ConsoleViewModel, c: LocalBaseController, ports: List<UsbPortRef>, context: Context, backendUrl: String) {
+    var port by rememberPortSelection(ports, 0)
+    var minDuration by rememberSaveable { mutableStateOf("60") }
+    var accLimit by rememberSaveable { mutableStateOf("2.0") }
+    val md = minDuration.toIntOrNull()
+    val al = accLimit.toDoubleOrNull()
+    val inputsOk = md != null && md > 0 && al != null && al > 0
 
-@Composable
-private fun BaseCard(
-    controller: LocalBaseController, ports: List<UsbPortRef>, context: Context,
-    backendUrl: String, channel: String, onChannelChange: (String) -> Unit,
-) {
-    var port by remember { mutableStateOf<UsbPortRef?>(null) }
-    var baud by remember { mutableStateOf("115200") }
-    var minDuration by remember { mutableStateOf("60") }
-    var accLimit by remember { mutableStateOf("2.0") }
-
-    LaunchedEffect(ports) { if (port == null && ports.isNotEmpty()) port = ports.first() }
-
+    val badgeColor = when {
+        c.phase == "broadcasting" -> Good
+        c.phase.startsWith("broadcasting") || c.phase == "surveying" || c.phase == "configuring" -> Warn
+        c.phase == "error" || c.phase == "stopped" -> Bad
+        else -> Color.Unspecified
+    }
     ElevatedCard(modifier = Modifier.fillMaxWidth()) {
         Column(Modifier.padding(14.dp)) {
-            Text("Base (USB)", fontWeight = FontWeight.Bold)
+            TitleRow("1. Base (USB)", if (c.running || c.phase != "idle") c.phase else null, badgeColor)
             Text(
-                "Start this first, with the receiver plugged in. Leave it running for the whole survey.",
+                "Start first, under open sky, and leave it running for the whole survey. Baud rate is detected automatically.",
                 fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant
             )
             Spacer(Modifier.height(8.dp))
-            UsbPortDropdown("USB receiver (base)", ports, port) { port = it }
-            NumberRow("Min duration (s)", minDuration, { minDuration = it }, "Accuracy limit (m)", accLimit, { accLimit = it })
-            RelayChannelField(channel, onChannelChange)
-            Spacer(Modifier.height(4.dp))
-            BaudField(baud) { baud = it }
-            Spacer(Modifier.height(8.dp))
-            Row {
+            UsbPortDropdown("USB receiver (base)", ports, port, !c.running) { port = it }
+            Row(Modifier.fillMaxWidth().padding(top = 6.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                NumberField("Min duration (s)", minDuration, !c.running, Modifier.weight(1f)) { minDuration = it }
+                NumberField("Accuracy limit (m)", accLimit, !c.running, Modifier.weight(1f)) { accLimit = it }
+            }
+            ChannelField(vm, !c.running)
+            Row(Modifier.padding(top = 8.dp)) {
                 Button(
-                    enabled = !controller.running && port != null,
-                    onClick = {
-                        val p = port ?: return@Button
-                        val b = baud.toIntOrNull() ?: 115200
-                        val md = minDuration.toIntOrNull() ?: 60
-                        val al = accLimit.toDoubleOrNull() ?: 2.0
-                        controller.start(context, p, b, md, al, backendUrl, channel)
-                    },
+                    enabled = !c.running && port != null && inputsOk && vm.channel.isNotBlank(),
+                    onClick = { port?.let { c.start(context, it, md!!, al!!, backendUrl, vm.channel) } },
                 ) { Text("Start base") }
                 Spacer(Modifier.width(8.dp))
-                OutlinedButton(enabled = controller.running, onClick = { controller.stop() }) { Text("Stop") }
+                OutlinedButton(enabled = c.running, onClick = { c.stop() }) { Text("Stop") }
             }
-            StatusBox(
-                controller.startError ?: controller.error?.let { "ERROR: $it" } ?: controller.statusText,
-                controller.error != null || controller.startError != null,
-            )
+            if (!inputsOk) Text("Min duration and accuracy limit must be positive numbers.", color = Bad, fontSize = 12.sp)
+            StatusBox(c.error?.let { "ERROR: $it" } ?: c.statusText, c.error != null)
         }
     }
 }
 
+private fun parseOrigin(lat: String, lon: String, alt: String): Result<Origin?> {
+    val vals = listOf(lat, lon, alt).map { it.trim() }
+    if (vals.all { it.isEmpty() }) return Result.success(null)
+    val nums = vals.map { it.toDoubleOrNull() }
+    if (nums.any { it == null }) return Result.failure(IllegalArgumentException("origin lat/lon/alt must all be numbers (or all empty)"))
+    return Result.success(Origin(nums[0]!!, nums[1]!!, nums[2]!!))
+}
+
 @Composable
-private fun PointCard(
-    controller: LocalRoverController, ports: List<UsbPortRef>, context: Context,
-    backendUrl: String, channel: String, onChannelChange: (String) -> Unit,
-    originLat: String, originLon: String, originAlt: String,
-    onOriginFilled: (String, String, String) -> Unit,
-) {
-    var port by remember { mutableStateOf<UsbPortRef?>(null) }
-    var baud by remember { mutableStateOf("115200") }
-    var duration by remember { mutableStateOf("60") }
-    var label by remember { mutableStateOf("") }
-    var requireFixed by remember { mutableStateOf(true) }
-    var oLat by remember { mutableStateOf(originLat) }
-    var oLon by remember { mutableStateOf(originLon) }
-    var oAlt by remember { mutableStateOf(originAlt) }
+private fun PointCard(vm: ConsoleViewModel, c: LocalRoverController, ports: List<UsbPortRef>, context: Context, backendUrl: String) {
+    var port by rememberPortSelection(ports, 1)
+    var duration by rememberSaveable { mutableStateOf("60") }
+    var label by rememberSaveable { mutableStateOf("") }
+    var requireFixed by rememberSaveable { mutableStateOf(true) }
 
-    LaunchedEffect(ports) { if (port == null && ports.isNotEmpty()) port = ports.first() }
-
-    LaunchedEffect(controller.result) {
-        val r = controller.result ?: return@LaunchedEffect
+    LaunchedEffect(c.result) {
+        val r = c.result ?: return@LaunchedEffect
         if (r.label == "origin" && !r.cancelled) {
-            oLat = r.latDeg.toString(); oLon = r.lonDeg.toString(); oAlt = r.heightMslM.toString()
-            onOriginFilled(oLat, oLon, oAlt)
+            vm.originLat = fmt(r.latDeg, 9); vm.originLon = fmt(r.lonDeg, 9); vm.originAlt = fmt(r.heightMslM, 3)
         }
     }
+    val d = duration.toDoubleOrNull()
+    val origin = parseOrigin(vm.originLat, vm.originLon, vm.originAlt)
+    val originErr = origin.exceptionOrNull()?.message?.takeIf { label.trim() != "origin" }
 
     ElevatedCard(modifier = Modifier.fillMaxWidth()) {
         Column(Modifier.padding(14.dp)) {
-            Text("Rover - survey a point (USB)", fontWeight = FontWeight.Bold)
+            TitleRow("2. Rover - survey a point (USB)", c.fixBadge, fixColor(c.fixBadge))
             Text(
-                "Carry the phone (with the receiver plugged in) to the spot you're recording. Survey \"origin\" first.",
+                "Survey \"origin\" first. Wait for FIX=true before trusting a point.",
                 fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant
             )
             Spacer(Modifier.height(8.dp))
-            UsbPortDropdown("USB receiver (rover)", ports, port) { port = it }
-            NumberRow("Baud", baud, { baud = it }, "Duration (s)", duration, { duration = it })
-            RelayChannelField(channel, onChannelChange)
+            UsbPortDropdown("USB receiver (rover)", ports, port, !c.running) { port = it }
+            NumberField("Duration (s)", duration, !c.running, Modifier.fillMaxWidth().padding(top = 6.dp)) { duration = it }
+            ChannelField(vm, !c.running)
             OutlinedTextField(
-                value = label, onValueChange = { label = it },
-                label = { Text("Label (origin, camera_a, camera_b, ...)") },
+                value = label, onValueChange = { label = it }, enabled = !c.running,
+                label = { Text("Label (origin, camera_a, ...)") },
                 singleLine = true, modifier = Modifier.fillMaxWidth().padding(top = 6.dp),
             )
             Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(top = 6.dp)) {
-                Checkbox(checked = requireFixed, onCheckedChange = { requireFixed = it })
-                Text("RTK FIXED epochs only", fontSize = 12.sp)
+                Checkbox(checked = requireFixed, onCheckedChange = { requireFixed = it }, enabled = !c.running)
+                Text("RTK FIXED epochs only (untick to also accept FLOAT)", fontSize = 12.sp)
             }
-            Spacer(Modifier.height(4.dp))
-            Text("Origin reference (auto-filled after surveying \"origin\")", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text("Origin (auto-filled after surveying \"origin\")", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                OutlinedTextField(oLat, { oLat = it }, label = { Text("lat") }, singleLine = true, modifier = Modifier.weight(1f))
-                OutlinedTextField(oLon, { oLon = it }, label = { Text("lon") }, singleLine = true, modifier = Modifier.weight(1f))
-                OutlinedTextField(oAlt, { oAlt = it }, label = { Text("alt") }, singleLine = true, modifier = Modifier.weight(1f))
+                NumberField("lat", vm.originLat, !c.running, Modifier.weight(1f)) { vm.originLat = it }
+                NumberField("lon", vm.originLon, !c.running, Modifier.weight(1f)) { vm.originLon = it }
+                NumberField("alt", vm.originAlt, !c.running, Modifier.weight(1f)) { vm.originAlt = it }
             }
-            Spacer(Modifier.height(8.dp))
-            Row {
+            if (originErr != null) Text(originErr, color = Bad, fontSize = 12.sp)
+            Row(Modifier.padding(top = 8.dp)) {
                 Button(
-                    enabled = !controller.running && port != null && label.isNotBlank(),
+                    enabled = !c.running && port != null && label.isNotBlank() && d != null && d > 0 && originErr == null && vm.channel.isNotBlank(),
                     onClick = {
                         val p = port ?: return@Button
-                        val b = baud.toIntOrNull() ?: 115200
-                        val d = duration.toDoubleOrNull() ?: 60.0
-                        val origin = if (oLat.isNotBlank() && oLon.isNotBlank() && oAlt.isNotBlank() && label != "origin") {
-                            Origin(oLat.toDoubleOrNull() ?: 0.0, oLon.toDoubleOrNull() ?: 0.0, oAlt.toDoubleOrNull() ?: 0.0)
-                        } else null
-                        controller.startPoint(context, p, b, backendUrl, channel, label, d, requireFixed, origin)
+                        val o = if (label.trim() == "origin") null else origin.getOrNull()
+                        c.startPoint(context, p, backendUrl, vm.channel, label.trim(), d!!, requireFixed, o)
                     },
                 ) { Text("Survey this point") }
                 Spacer(Modifier.width(8.dp))
-                OutlinedButton(enabled = controller.running, onClick = { controller.stop() }) { Text("Stop") }
+                OutlinedButton(enabled = c.running, onClick = { c.stop() }) { Text("Stop") }
             }
-            StatusBox(
-                controller.startError ?: controller.error?.let { "ERROR: $it" } ?: controller.statusText,
-                controller.error != null || controller.startError != null,
-            )
-            controller.result?.let { r -> PointResultView(r) }
+            StatusBox(c.error?.let { "ERROR: $it" } ?: c.statusText, c.error != null)
+            c.result?.let { PointResultView(it) }
         }
     }
 }
 
 @Composable
 private fun PointResultView(r: PointResult) {
-    if (r.cancelled) {
-        Text("cancelled", fontSize = 12.sp, modifier = Modifier.padding(top = 8.dp))
-        return
-    }
+    if (r.cancelled) return
     Surface(
         color = MaterialTheme.colorScheme.surfaceVariant,
         shape = MaterialTheme.shapes.small,
         modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
     ) {
         Column(Modifier.padding(10.dp)) {
-            Text("label: ${r.label}", fontSize = 12.sp)
-            Text("lat: ${r.latDeg}", fontSize = 12.sp)
-            Text("lon: ${r.lonDeg}", fontSize = 12.sp)
-            Text("height_msl_m: ${r.heightMslM}", fontSize = 12.sp)
-            Text("epochs: ${r.n}  spread: ${"%.3f".format(r.spreadM)}m  fix=${r.allFixed}  (fix=true means every collected epoch was RTK FIXED)", fontSize = 12.sp)
+            val mono = FontFamily.Monospace
+            Text("label: ${r.label}", fontSize = 12.sp, fontFamily = mono)
+            Text("lat: ${fmt(r.latDeg, 9)}", fontSize = 12.sp, fontFamily = mono)
+            Text("lon: ${fmt(r.lonDeg, 9)}", fontSize = 12.sp, fontFamily = mono)
+            Text("height_msl_m: ${fmt(r.heightMslM, 3)}", fontSize = 12.sp, fontFamily = mono)
+            Text("epochs: ${r.n}  spread: ${fmt(r.spreadM, 3)}m", fontSize = 12.sp, fontFamily = mono)
+            Text(
+                "fix=${r.allFixed}  (fix=true: every averaged epoch was RTK FIXED)",
+                fontSize = 12.sp, fontFamily = mono, fontWeight = FontWeight.Bold, color = if (r.allFixed) Good else Warn,
+            )
             if (r.originE != null) {
                 Spacer(Modifier.height(4.dp))
-                Text("origin_e: ${"%.4f".format(r.originE)}", fontSize = 12.sp)
-                Text("origin_n: ${"%.4f".format(r.originN)}", fontSize = 12.sp)
-                Text("origin_u: ${"%.4f".format(r.originU)}", fontSize = 12.sp)
+                Text("origin_e: ${fmt(r.originE, 4)}", fontSize = 12.sp, fontFamily = mono)
+                Text("origin_n: ${fmt(r.originN!!, 4)}", fontSize = 12.sp, fontFamily = mono)
+                Text("origin_u: ${fmt(r.originU!!, 4)}", fontSize = 12.sp, fontFamily = mono)
             }
         }
     }
 }
 
 @Composable
-private fun RoverMonitorCard(
-    controller: LocalRoverController, ports: List<UsbPortRef>, context: Context,
-    backendUrl: String, channel: String, onChannelChange: (String) -> Unit,
-) {
-    var expanded by remember { mutableStateOf(false) }
-    var port by remember { mutableStateOf<UsbPortRef?>(null) }
-    var baud by remember { mutableStateOf("115200") }
-
-    LaunchedEffect(ports) { if (port == null && ports.isNotEmpty()) port = ports.first() }
+private fun RoverMonitorCard(vm: ConsoleViewModel, c: LocalRoverController, ports: List<UsbPortRef>, context: Context, backendUrl: String) {
+    var expanded by rememberSaveable { mutableStateOf(false) }
+    var port by rememberPortSelection(ports, 1)
 
     ElevatedCard(modifier = Modifier.fillMaxWidth()) {
         Column(Modifier.padding(14.dp)) {
@@ -461,37 +451,26 @@ private fun RoverMonitorCard(
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                Column {
-                    Text("Rover - live monitor (USB, optional)", fontWeight = FontWeight.Bold)
-                    Text(
-                        "Advanced: watch the raw fix without recording a point.",
-                        fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
+                Column(Modifier.weight(1f)) {
+                    Text("Rover - live monitor (optional)", fontWeight = FontWeight.Bold)
+                    Text("Watch FIX status without recording. A point survey on the same receiver stops this automatically.",
+                        fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
-                Text(if (expanded) "hide" else "show", fontSize = 12.sp)
+                if (c.fixBadge != null) Badge(c.fixBadge, fixColor(c.fixBadge)) else Text(if (expanded) "hide" else "show", fontSize = 12.sp)
             }
-            if (expanded) {
+            if (expanded || c.running) {
                 Spacer(Modifier.height(8.dp))
-                UsbPortDropdown("USB receiver", ports, port) { port = it }
-                BaudField(baud) { baud = it }
-                RelayChannelField(channel, onChannelChange)
-                Spacer(Modifier.height(8.dp))
-                Row {
+                UsbPortDropdown("USB receiver", ports, port, !c.running) { port = it }
+                ChannelField(vm, !c.running)
+                Row(Modifier.padding(top = 8.dp)) {
                     Button(
-                        enabled = !controller.running && port != null,
-                        onClick = {
-                            val p = port ?: return@Button
-                            val b = baud.toIntOrNull() ?: 115200
-                            controller.startMonitor(context, p, b, backendUrl, channel)
-                        },
+                        enabled = !c.running && port != null && vm.channel.isNotBlank(),
+                        onClick = { port?.let { c.startMonitor(context, it, backendUrl, vm.channel) } },
                     ) { Text("Start") }
                     Spacer(Modifier.width(8.dp))
-                    OutlinedButton(enabled = controller.running, onClick = { controller.stop() }) { Text("Stop") }
+                    OutlinedButton(enabled = c.running, onClick = { c.stop() }) { Text("Stop") }
                 }
-                StatusBox(
-                    controller.startError ?: controller.error?.let { "ERROR: $it" } ?: controller.statusText,
-                    controller.error != null || controller.startError != null,
-                )
+                StatusBox(c.error?.let { "ERROR: $it" } ?: c.statusText, c.error != null)
             }
         }
     }

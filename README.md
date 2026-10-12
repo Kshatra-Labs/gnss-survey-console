@@ -1,118 +1,123 @@
 # GNSS Survey Console
 
-A web app (and Android app) to run RTK GNSS survey with u-blox F9P
-receivers. Both **Base** and **Rover** plug into USB ports on real devices
-and run entirely on-device (browser via Web Serial, or the Android app) -
-there is no "remote base" mode and no local backend process that touches
-USB/serial. The only thing that crosses the network is the RTCM3
-correction bytes, through a thin cloud relay that has no hardware
-dependency of its own.
+RTK GNSS surveying with two u-blox F9P receivers, from a web page or an
+Android app. Both **Base** and **Rover** plug into USB on real devices and
+are driven directly (browser via Web Serial, or the app). Only RTCM3
+correction frames cross the network, through a small cloud relay that has
+no hardware of its own.
 
-## What it does, in plain terms
+One link: **https://kshatra-labs.github.io/gnss-survey-console/**
+(Chrome or Edge - Web Serial isn't in Firefox/Safari). It's pre-filled with
+the relay address, so opening it and connecting a receiver is the setup.
 
-Two RTK GPS receivers, one acting as a fixed **base** and one as a
-**rover** you carry around, can measure a position to within a couple of
-centimetres - far better than a phone GPS (~3-5 m):
+## What it does
 
-1. **Base**: plug a receiver into a USB port (phone or laptop, via USB-C/
-   OTG), connect it, click Start. It sits still and works out its own
-   position precisely over a minute or two ("survey-in"), then uploads
-   correction data to the cloud relay on a named **channel**.
-2. **Rover**: plug the second receiver into a USB port on whatever device
-   you're carrying around, connect it, and pull corrections from the same
-   relay channel. Live RTK-corrected position, no server round-trip.
-3. **Point**: like rover, but it also averages a run of readings and hands
-   back one clean lat/lon/height - what you actually use to record a survey
-   point.
+Two RTK receivers - one fixed **base**, one **rover** you carry - measure a
+position to a couple of centimetres (a phone GPS manages ~3-5 m):
 
-One link to remember: **https://kshatra-labs.github.io/gnss-survey-console/**
-- it's autofilled with this project's relay address already, so opening it
-  and connecting a USB receiver is the entire setup. Requires Chrome or
-  Edge (Web Serial API) - not Firefox or Safari.
-
-## The relay, and where it runs
-
-The backend (`server/app.py`) does two things only: serves the static page,
-and relays RTCM3 bytes between whichever browser/app has "base" open on a
-channel and whichever has "rover" open on the same channel. It never
-touches a serial port - that's deliberate, and it's why this piece (unlike
-an actual GPS receiver) can run on ordinary free cloud compute instead of
-needing to be near the hardware.
-
-It's live on [Render](https://render.com)'s free tier (no credit card),
-deployed straight from this repo via the `render.yaml` blueprint:
-
-**`https://gnss-relay.onrender.com`**
-
-That's the default baked into the page and the Android app - nothing to
-configure. The GitHub Pages site above is also built and published
-straight from this same repo (`.github/workflows/pages.yml` publishes
-`web/` on every push to `main`) - there used to be a second, separate repo
-just for the static page; it's gone now, everything lives here.
-
-Free-tier tradeoff: Render spins the service down after ~15 minutes idle
-and takes 30-60s to wake on the next connection - fine here, since nothing
-survey-related happens instantly anyway, and both the web page and the
-Android app already auto-reconnect with a short backoff. If that cold
-start ever becomes annoying, a free
-[cron-job.org](https://cron-job.org) ping every 10 minutes keeps it warm.
-
-Want to run your own instead of the shared one above? Fork this repo,
-redo the Render blueprint step against your fork (dashboard.render.com/
-blueprints → New Blueprint Instance), then point `DEFAULT_BACKEND` in
-`web/app.js` / `MainActivity.kt` (and the **Cloud relay** field on the
-page/app) at your own `.onrender.com` URL.
-
-**No authentication** on the relay - anyone with its address can push bytes
-onto a channel, so don't use a guessable channel name if that matters to
-you, and don't post the relay URL publicly if you'd rather it stayed
-private.
+1. **Base**: plug in, connect, Start. It surveys its own position
+   ("survey-in", needs open sky), then streams corrections to the relay on a
+   named **channel**.
+2. **Rover**: plug in, connect, and it pulls corrections from the same
+   channel. **Live monitor** shows the fix; **Survey this point** averages a
+   run of RTK FIXED epochs into one lat/lon/height.
 
 ## Using the page
 
-1. **Cloud relay** field at the top - leave it on the default.
-2. **1. Base (USB)** - connect the receiver staying put, set the relay
-   channel if you're not using `"default"`, **Start base**. Watch it move
-   `surveying` → `broadcasting` (needs real open sky); corrections only
-   exist once it says `broadcasting`.
-3. **2. Rover - survey a point** - connect the receiver you're carrying,
-   confirm the channel matches Base's, give it a **Label**, **Start**. Let
-   it run the full duration. Survey `origin` first - its result auto-fills
-   the Origin fields below, so every point after that gets its east/north/
-   up offset computed automatically.
-4. **Rover - live monitor** (collapsed, under the Rover panel) - same live
-   feed without averaging, useful to confirm RTK FIXED before a timed run.
+1. **Cloud relay** - leave the default. The line under it confirms the relay
+   is reachable (a free-tier relay asleep for >15 min takes up to a minute to
+   wake; the page waits for it).
+2. **1. Base (USB)** - Connect (baud rate is detected automatically), set the
+   channel if not `default`, **Start base**. It goes `surveying` ->
+   `broadcasting`. Keep the tab open; the screen is kept awake.
+3. **2. Rover** - Connect the other receiver, same channel. Use **Live
+   monitor** until it shows `FIX=true  RTK FIXED`, then survey `origin`
+   first (it fills the Origin fields), then each point - every later point
+   gets its east/north/up offset from origin.
 
-The result's numbers are meant to be copied straight into
-`Ground_EO_Tracker/hawk_nest/config/cameras.local.yaml`'s `local_frame` /
-`origin_e/n/u` fields (or run `Ground_EO_Tracker/tools/gnss/survey.py point
---write ...` - same math, writes the file for you - a separate CLI tool
-with its own base+rover-over-TCP workflow, unrelated to this project's
-cloud relay).
+Every connected panel shows live stats, for example on the rover:
 
-## Only one receiver?
+```
+FIX=true  RTK FIXED  corrections used=true  fixType=3D  sv=24  hAcc=0.006m  vAcc=0.009m
+relay: connected  bytes received=17388  last=0.2s ago
+RTCM in: 1005x28 1074x28 1084x28 1094x28 1124x28 1230x28  (last valid frame 0.2s ago)
+channel "default": base online=true  rovers=1  base data last=0.0s ago
+```
 
-For single-receiver surveying against a real NTRIP correction service
-instead of your own base, use
-`Ground_EO_Tracker/tools/gnss/survey.py point --corrections ntrip://...`
-directly - that mode lives in that repo's CLI, not here.
+and on the base: survey-in progress, the receiver's own RTCM output by
+message type, bytes uploaded, and how many rovers are listening. When a
+point run can't record anything, the error says why from what was actually
+observed - no base on the channel, zero correction bytes, bytes that weren't
+RTCM, or corrections arriving but never reaching FIXED.
+
+Point results go straight into
+`Ground_EO_Tracker/hawk_nest/config/cameras.local.yaml` (`local_frame`,
+`origin_e/n/u`). That repo's `tools/gnss/survey.py point --write` is a
+separate CLI with its own base+rover-over-TCP workflow; for a single receiver
+with an NTRIP service use `survey.py point --corrections ntrip://...`.
+
+## The relay
+
+`server/app.py` does three things: relays a channel's base bytes to its
+rovers, reports channel status, and serves the page.
+
+| | |
+|---|---|
+| `GET /healthz` | liveness + version |
+| `GET /status/{channel}` | base online?, how many bases/rovers, bytes, age of last base data |
+| `WS /ws/relay/{channel}?role=base\|rover` | the relay itself |
+
+It runs on [Render](https://render.com)'s free tier at
+**`https://gnss-relay.onrender.com`**, deployed from this repo by
+`render.yaml` on every push to `main`. GitHub Pages is published from the
+same repo (`.github/workflows/pages.yml` ships `web/`).
+
+Free-tier tradeoff: Render sleeps after ~15 min without requests and takes
+30-60 s to wake. While a session runs, each device polls `/status` every 5 s,
+which also keeps it awake; connections retry every 3 s.
+
+Behaviour worth knowing: the base uploads only CRC-valid RTCM3 frames (its
+NMEA/UBX would otherwise land in every rover's receiver input). If two bases
+use one channel, only the newest is relayed and both sides show a warning.
+A rover that stops reading is dropped after 5 s so it can't stall the others.
+
+**No authentication** - anyone with the relay address and a channel name can
+send or receive on it. Use a non-obvious channel name if that matters.
+
+Run your own: `pip install -r requirements.txt && python3 server/app.py`
+(or fork and redo the Render blueprint), then put its address in the page's
+Cloud relay field / `DEFAULT_BACKEND` in `web/app.js` and `MainActivity.kt`.
+A bare `192.168.x.x:8765` is treated as `http://`, public names as `https://`.
 
 ## Android app
 
-`android/` runs the same USB-direct Base/Rover model natively, sharing the
-cloud relay with the web page - a base running in the app can feed a rover
-in a browser, or vice versa. See `android/README.md` to build and run it.
+`android/` does the same natively and shares the relay - a base in the app
+feeds a rover in a browser and vice versa. See `android/README.md`.
+
+## Testing
+
+```bash
+tests/run_all.sh                 # everything
+SKIP_ANDROID=1 tests/run_all.sh  # without the Android toolchain
+```
+
+| Suite | What it proves |
+|---|---|
+| `tests/oracle/` | UBX/RTCM test vectors generated by **pyubx2/pyrtcm** - independent implementations - so the parsers are checked against a third party, and our encoded frames are parsed back by pyubx2 |
+| `tests/web/protocol.test.js` | `web/gnss.js` against those vectors, plus stream recovery from noise and false sync bytes |
+| `tests/web/f9p_sim.js` | a ZED-F9P simulator written from the spec (verified by pyubx2 in `check_sim.py`): baud mismatch, ACK/NAK, input protocol masks, survey-in -> time mode, RTK that only fixes while valid RTCM keeps arriving |
+| `tests/web/e2e.js` | the real page in jsdom, served by the real relay, with simulated receivers: auto-baud, ex-base receiver recovery, no-base diagnosis, survey-in -> broadcast -> RTK FIXED, origin + offset accuracy, FLOAT handling, serial buffer overrun, relay restart mid-session, base restart, unplugging |
+| `tests/server/test_relay.py` | relay behaviour: fan-out, ordering, status, two-base conflict, isolation, stalled rover (also runs against a deployed URL) |
+| `android/app/src/test/` | `Ubx.kt`/`Rtcm.kt` against the same vectors; the app's real session + relay code end to end against simulated receivers and a real relay process |
+
+What isn't covered: real radio conditions and specific USB chip/driver
+quirks, which only a field test with the actual receivers exercises.
 
 ## Layout
 
 | Path | What |
 |---|---|
-| `server/app.py` | the entire backend: CORS + the `/ws/relay/{channel}` byte relay + serving `web/` as static files |
-| `web/` | the browser page - `gnss.js` (UBX protocol), `wgs84.js` (WGS84↔ENU math), `webserial.js` (Web Serial + relay client), `app.js` (UI wiring) |
-| `android/` | native phone client, same relay protocol (see `android/README.md`) |
-
-## Possible next step
-
-Done - the relay now runs on Render, fully decoupled from any one
-machine, and the repo is unified (the separate Pages-only repo was
-retired and merged into this one).
+| `server/app.py` | the relay (+ serves `web/`) |
+| `web/` | `gnss.js` UBX/RTCM3 protocol, `wgs84.js` WGS84<->ENU, `webserial.js` Web Serial connection + relay client, `app.js` the page |
+| `android/` | native app, same protocol (see `android/README.md`) |
+| `tests/` | see Testing |

@@ -41,6 +41,8 @@
   .status.err { color: var(--bad); }
   .badge { position: absolute; top: 14px; right: 16px; font-size: 11px; padding: 2px 8px; border-radius: 999px; background: #0b0f13; color: var(--muted); border: 1px solid var(--border); }
   .badge.live { color: var(--good); border-color: var(--good); }
+  .badge.warn { color: var(--warn); border-color: var(--warn); }
+  .badge.bad { color: var(--bad); border-color: var(--bad); }
   .checkbox-row { display: flex; align-items: center; gap: 8px; margin-top: 10px; }
   .checkbox-row input { width: auto; }
   .result { margin-top: 10px; }
@@ -88,8 +90,9 @@
   <div class="step-hint">Where Base and Rover find each other. Auto-filled with this project's known address - only change it if you're running your own relay.</div>
   <div class="row">
     <input id="serverUrl" placeholder="https://your-relay-address">
-    <button id="serverConnect" style="flex:0 0 auto;margin-top:0">Save</button>
+    <button id="serverConnect" style="flex:0 0 auto;margin-top:0">Save &amp; test</button>
   </div>
+  <div id="relayHealth" class="status">checking relay...</div>
 </div>
 
 <div class="grid">
@@ -97,7 +100,7 @@
   <div id="baseUsbPanel" class="panel base">
     <span id="baseUsbBadge" class="badge">idle</span>
     <h2>1. Base (USB)</h2>
-    <div class="step-hint">Plug the base receiver in, connect it, then leave it running for the whole survey.</div>
+    <div class="step-hint">Plug the base receiver in, connect it (baud rate is detected automatically), then leave it running for the whole survey.</div>
     <div id="baseUsbUnsupported" class="unsupported" style="display:none;">
       This browser doesn't support direct USB access (Web Serial). Use Chrome or Edge.
     </div>
@@ -115,7 +118,7 @@
       </details>
       <label>Relay channel (must match the rover's)</label>
       <input id="baseUsbChannel" value="default">
-      <small class="hint">Needs open sky. Status moves surveying -> broadcasting; corrections are only live once it says "broadcasting".</small>
+      <small class="hint">Needs open sky. Status moves surveying -> broadcasting; corrections only exist once it says "broadcasting". Keep this tab open and the device awake.</small>
       <button id="baseUsbStart">Start base</button>
       <button id="baseUsbStop" class="stop" disabled>Stop</button>
     </div>
@@ -125,7 +128,7 @@
   <div class="panel point">
     <span id="usbBadge" class="badge">idle</span>
     <h2>2. Rover - survey a point (USB)</h2>
-    <div class="step-hint">Plug the receiver in, connect it below, then carry it to each spot you're recording. Survey "origin" first.</div>
+    <div class="step-hint">Plug the receiver in, connect it below (baud rate is detected automatically), then carry it to each spot you're recording. Survey "origin" first. Wait for FIX=true in the live status before trusting a point.</div>
 
     <div id="usbUnsupported" class="unsupported" style="display:none;">
       This browser doesn't support direct USB access (Web Serial). Use Chrome or Edge.

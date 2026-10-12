@@ -1,5 +1,7 @@
 package com.kshatralabs.gnssconsole.gnss
 
+import okhttp3.HttpUrl
+import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
@@ -7,171 +9,254 @@ import okhttp3.WebSocket
 import okhttp3.WebSocketListener
 import okio.ByteString
 import okio.ByteString.Companion.toByteString
+import org.json.JSONObject
+import java.io.ByteArrayOutputStream
+import java.io.IOException
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicLong
 
-/** Client for the backend's pure byte relay (server/app.py's
- * /ws/relay/{channel}) - the same cloud hub the web console's
- * webserial.js's startRelayUpload/startRelayDownload talk to, so a base
- * running in this app can feed a rover in a browser and vice versa. The
- * relay itself has no USB/serial dependency; only this app's own USB
- * connection does. */
+/** Client for the cloud relay (server/app.py) - same protocol as
+ * web/webserial.js, so app and browser bases/rovers interoperate. */
 object RelayClient {
-    private val client = OkHttpClient.Builder()
-        .pingInterval(20, TimeUnit.SECONDS) // keeps the socket alive through idle periods / NAT timeouts
+    // No read timeout on the socket itself: a rover's link is legitimately
+    // silent while no base is broadcasting. Liveness comes from pings - a
+    // missed pong fails the socket and the reconnect loop takes over.
+    private val wsClient = OkHttpClient.Builder()
+        .pingInterval(15, TimeUnit.SECONDS)
+        .connectTimeout(30, TimeUnit.SECONDS)
+        .readTimeout(0, TimeUnit.MILLISECONDS)
         .build()
 
-    data class Stats(val bytes: Long, val ageS: Double?)
+    private val httpClient = OkHttpClient.Builder()
+        .callTimeout(20, TimeUnit.SECONDS)
+        .build()
 
-    private fun wsUrl(backendUrl: String, channel: String, role: String): String {
-        val base = backendUrl.trimEnd('/').replaceFirst(Regex("^http"), "ws")
-        return "$base/ws/relay/$channel?role=$role"
+    /** "gnss-relay.onrender.com/" -> https://..., "192.168.1.5:8765" -> http://... */
+    fun normalizeUrl(url: String): String {
+        var u = url.trim()
+        if (!Regex("^[a-zA-Z]+://").containsMatchIn(u)) {
+            val host = u.split('/', ':').first().lowercase()
+            val local = host == "localhost" || host.startsWith("127.") || host.startsWith("10.") ||
+                host.startsWith("192.168.") || Regex("^172\\.(1[6-9]|2\\d|3[01])\\.").containsMatchIn(host) || host.endsWith(".local")
+            u = (if (local) "http://" else "https://") + u
+        }
+        return u.trimEnd('/')
     }
 
-    /** Free-tier relay hosts (Render) spin down after ~15min idle; waking
-     * one up on the WebSocket handshake itself is flaky, so fire a plain
-     * GET in parallel - best-effort, errors ignored - to get it moving
-     * before the WS connect (and its 3s-backoff retries) catch up. */
-    private fun warmUp(backendUrl: String) {
-        try {
-            val req = Request.Builder().url(backendUrl.trimEnd('/') + "/").build()
-            client.newCall(req).enqueue(object : okhttp3.Callback {
-                override fun onFailure(call: okhttp3.Call, e: java.io.IOException) {}
-                override fun onResponse(call: okhttp3.Call, response: Response) { response.close() }
-            })
-        } catch (e: Exception) { /* ignore */ }
-    }
+    /** Throws IllegalArgumentException for an unusable address. */
+    fun baseUrl(backendUrl: String): HttpUrl = normalizeUrl(backendUrl).toHttpUrl()
 
-    /** Base side: call feed(bytes) with raw receiver output (post-survey-in)
-     * to upload it to the relay. Returns a handle whose stop() closes the
-     * link; reconnects automatically on drop, same as the web version. */
-    fun startUpload(backendUrl: String, channel: String, onStatus: (String) -> Unit): Upload {
-        val upload = Upload(backendUrl, channel, onStatus)
-        upload.connect()
-        return upload
-    }
+    private fun wsUrl(backendUrl: String, channel: String, role: String): HttpUrl =
+        baseUrl(backendUrl).newBuilder().addPathSegments("ws/relay").addPathSegment(channel)
+            .addQueryParameter("role", role).build()
 
-    class Upload(private val backendUrl: String, private val channel: String, private val onStatus: (String) -> Unit) {
+    private fun ago(at: Long): String =
+        if (at == 0L) "never" else "${fmt((System.currentTimeMillis() - at) / 1000.0, 1)}s ago"
+
+    /** GET /status/{channel} - immediately, after 1.5 s, then every 5 s.
+     * Shows whether a base is live on the channel and doubles as the
+     * keep-alive that stops a free-tier relay host idling to sleep. */
+    class ChannelStatus(private val backendUrl: String, private val channel: String) {
+        data class Snapshot(
+            val ok: Boolean?, val baseOnline: Boolean = false, val bases: Int = 0, val rovers: Int = 0,
+            val lastBaseDataAgeS: Double? = null, val error: String? = null,
+        )
+
+        @Volatile var snapshot = Snapshot(ok = null)
+            private set
         @Volatile private var stopped = false
-        @Volatile private var socket: WebSocket? = null
-        private val pending = java.util.concurrent.ConcurrentLinkedQueue<ByteString>()
-        private val byteCount = AtomicLong(0)
-        @Volatile private var lastAt = 0L
-        @Volatile private var isOpen = false
+        private val thread = Thread {
+            var polls = 0
+            while (!stopped) {
+                poll()
+                polls++
+                try { Thread.sleep(if (polls == 1) 1500L else 5000L) } catch (_: InterruptedException) { }
+            }
+        }.apply { isDaemon = true; start() }
 
-        fun connect() {
-            if (stopped) return
-            warmUp(backendUrl)
-            val req = Request.Builder().url(wsUrl(backendUrl, channel, "base")).build()
-            socket = client.newWebSocket(req, object : WebSocketListener() {
-                override fun onOpen(webSocket: WebSocket, response: Response) {
-                    isOpen = true
-                    onStatus("relay: uploading on channel \"$channel\"")
-                    var b = pending.poll()
-                    while (b != null) { webSocket.send(b); b = pending.poll() }
+        private fun poll() {
+            snapshot = try {
+                val url = baseUrl(backendUrl).newBuilder().addPathSegment("status").addPathSegment(channel).build()
+                httpClient.newCall(Request.Builder().url(url).build()).execute().use { r ->
+                    if (!r.isSuccessful) throw IOException("HTTP ${r.code}")
+                    val j = JSONObject(r.body!!.string())
+                    Snapshot(
+                        ok = true,
+                        baseOnline = j.getBoolean("base_online"),
+                        bases = j.getInt("bases"),
+                        rovers = j.getInt("rovers"),
+                        lastBaseDataAgeS = if (j.isNull("last_base_data_age_s")) null else j.getDouble("last_base_data_age_s"),
+                    )
                 }
-                override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
-                    isOpen = false
-                    reconnect()
-                }
-                override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-                    isOpen = false
-                    onStatus("relay: upload error (${t.message}), reconnecting")
-                    reconnect()
-                }
-            })
+            } catch (e: Exception) {
+                snapshot.copy(ok = false, error = e.message ?: e.javaClass.simpleName)
+            }
         }
 
-        private fun reconnect() {
-            if (stopped) return
-            Thread {
-                Thread.sleep(3000)
-                if (!stopped) connect()
-            }.also { it.isDaemon = true; it.start() }
-        }
-
-        fun feed(bytes: ByteArray, len: Int) {
-            if (stopped) return
-            val bs = bytes.copyOf(len).toByteString()
-            byteCount.addAndGet(len.toLong())
-            lastAt = System.currentTimeMillis()
-            val s = socket
-            if (s != null) s.send(bs) else pending.add(bs)
-        }
-
-        fun connected(): Boolean = isOpen
-        fun stats(): Stats {
-            val at = lastAt
-            return Stats(byteCount.get(), if (at == 0L) null else (System.currentTimeMillis() - at) / 1000.0)
+        fun line(role: String): String {
+            val s = snapshot
+            return when (s.ok) {
+                null -> "channel \"$channel\": checking..."
+                false -> "channel \"$channel\": relay status unavailable (${s.error})"
+                true -> buildString {
+                    val age = s.lastBaseDataAgeS?.let { "${fmt(it, 1)}s ago" } ?: "never"
+                    append("channel \"$channel\": base online=${s.baseOnline}  rovers=${s.rovers}  base data last=$age")
+                    if (s.bases > 1) append("  WARNING: ${s.bases} bases on this channel - only the newest is relayed")
+                    if (role == "rover" && !s.baseOnline) append("  <- no base is broadcasting on this channel")
+                }
+            }
         }
 
         fun stop() {
             stopped = true
-            try { socket?.close(1000, null) } catch (e: Exception) { }
+            thread.interrupt()
         }
     }
 
-    /** Rover side: onBytes is called with every chunk the relay forwards
-     * from whichever base is uploading on this channel. */
-    fun startDownload(backendUrl: String, channel: String, onBytes: (ByteArray) -> Unit, onStatus: (String) -> Unit): Download {
-        val download = Download(backendUrl, channel, onBytes, onStatus)
-        download.connect()
-        return download
-    }
-
-    class Download(
-        private val backendUrl: String, private val channel: String,
-        private val onBytes: (ByteArray) -> Unit, private val onStatus: (String) -> Unit,
-    ) {
+    abstract class Link(protected val backendUrl: String, protected val channel: String, private val role: String) {
+        val status = ChannelStatus(backendUrl, channel)
+        protected val bytes = AtomicLong(0)
+        protected val dropped = AtomicLong(0)
+        @Volatile protected var lastAt = 0L
+        @Volatile protected var socket: WebSocket? = null
+        @Volatile var isOpen = false
+            protected set
+        @Volatile var lastError: String? = null
+            protected set
         @Volatile private var stopped = false
-        @Volatile private var socket: WebSocket? = null
-        private val byteCount = AtomicLong(0)
-        @Volatile private var lastAt = 0L
-        @Volatile private var isOpen = false
+        // Callbacks from an older socket are ignored by generation, not by
+        // comparing to `socket`: OkHttp can call onOpen before
+        // newWebSocket() has even returned and been assigned.
+        @Volatile private var generation = 0
 
+        val byteCount: Long get() = bytes.get()
+
+        protected abstract fun onBinary(data: ByteArray)
+
+        @Synchronized
         fun connect() {
             if (stopped) return
-            warmUp(backendUrl)
-            val req = Request.Builder().url(wsUrl(backendUrl, channel, "rover")).build()
-            socket = client.newWebSocket(req, object : WebSocketListener() {
+            val url = try {
+                wsUrl(backendUrl, channel, role)
+            } catch (e: IllegalArgumentException) {
+                lastError = "bad relay address \"$backendUrl\""
+                return
+            }
+            val gen = ++generation
+            socket = wsClient.newWebSocket(Request.Builder().url(url).build(), object : WebSocketListener() {
                 override fun onOpen(webSocket: WebSocket, response: Response) {
+                    if (gen != generation) return
+                    socket = webSocket
                     isOpen = true
-                    onStatus("relay: receiving corrections on channel \"$channel\"")
+                    lastError = null
                 }
+
                 override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
-                    byteCount.addAndGet(bytes.size.toLong())
-                    lastAt = System.currentTimeMillis()
-                    onBytes(bytes.toByteArray())
+                    if (gen == generation) onBinary(bytes.toByteArray())
                 }
-                override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
-                    isOpen = false
-                    reconnect()
+
+                override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+                    webSocket.close(1000, null)
                 }
-                override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-                    isOpen = false
-                    onStatus("relay: corrections link error (${t.message}), reconnecting")
-                    reconnect()
-                }
+
+                override fun onClosed(webSocket: WebSocket, code: Int, reason: String) = onDropped(gen, "closed ($code)")
+
+                override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) =
+                    onDropped(gen, t.message ?: t.javaClass.simpleName)
             })
         }
 
-        private fun reconnect() {
+        private fun onDropped(gen: Int, why: String) {
+            if (gen != generation) return
+            isOpen = false
+            lastError = why
             if (stopped) return
             Thread {
-                Thread.sleep(3000)
+                try { Thread.sleep(3000) } catch (_: InterruptedException) { }
                 if (!stopped) connect()
-            }.also { it.isDaemon = true; it.start() }
+            }.apply { isDaemon = true; start() }
         }
 
-        fun connected(): Boolean = isOpen
-        fun stats(): Stats {
-            val at = lastAt
-            return Stats(byteCount.get(), if (at == 0L) null else (System.currentTimeMillis() - at) / 1000.0)
+        protected fun linkLine(verb: String): String = buildString {
+            append("relay: ${if (isOpen) "connected" else "connecting/reconnecting"}  bytes $verb=${bytes.get()}  last=${ago(lastAt)}")
+            if (dropped.get() > 0) append("  dropped while offline=${dropped.get()}")
+            if (!isOpen && lastError != null) append("  ($lastError)")
         }
 
-        fun stop() {
+        open fun stop() {
             stopped = true
-            try { socket?.close(1000, null) } catch (e: Exception) { }
+            status.stop()
+            try { socket?.close(1000, null) } catch (_: Exception) { }
+            isOpen = false
         }
     }
+
+    /** Base side: feed() the receiver's raw output; only CRC-valid RTCM3
+     * frames are uploaded (its NMEA/UBX would otherwise flood rovers'
+     * command inputs). Dropped, not queued, while the link is down. */
+    class Upload(backendUrl: String, channel: String) : Link(backendUrl, channel, "base") {
+        private val batch = ByteArrayOutputStream()
+        private val extractor = Rtcm.Scanner { frame, _ -> batch.write(frame) }
+
+        override fun onBinary(data: ByteArray) {}
+
+        fun feed(raw: ByteArray, len: Int) {
+            batch.reset()
+            extractor.feed(raw, len)
+            if (batch.size() == 0) return
+            val out = batch.toByteArray()
+            val s = socket
+            if (isOpen && s != null && s.send(out.toByteString())) {
+                bytes.addAndGet(out.size.toLong())
+                lastAt = System.currentTimeMillis()
+            } else {
+                dropped.addAndGet(out.size.toLong())
+            }
+        }
+
+        fun statsLine(): String = linkLine("sent")
+    }
+
+    /** Rover side: every chunk from the relay goes to onBytes (the
+     * receiver), with CRC-valid RTCM3 frames counted by type on the way. */
+    class Download(backendUrl: String, channel: String, private val onBytes: (ByteArray) -> Unit) :
+        Link(backendUrl, channel, "rover") {
+        val rtcmIn = Rtcm.Scanner()
+
+        override fun onBinary(data: ByteArray) {
+            bytes.addAndGet(data.size.toLong())
+            lastAt = System.currentTimeMillis()
+            rtcmIn.feed(data)
+            try { onBytes(data) } catch (_: Exception) { /* receiver unplugged: the session loop reports it */ }
+        }
+
+        fun statsLine(): String = linkLine("received")
+    }
+
+    private val healthClient = OkHttpClient.Builder()
+        .callTimeout(75, TimeUnit.SECONDS) // a sleeping free-tier relay can take ~1 min to wake
+        .build()
+
+    /** GET /healthz: (reachable, human-readable line). Blocking - call off the main thread. */
+    fun health(backendUrl: String): Pair<Boolean, String> {
+        val shown = normalizeUrl(backendUrl)
+        return try {
+            val url = baseUrl(backendUrl).newBuilder().addPathSegment("healthz").build()
+            val t0 = System.currentTimeMillis()
+            healthClient.newCall(Request.Builder().url(url).build()).execute().use { r ->
+                if (!r.isSuccessful) return false to "relay NOT reachable at $shown: HTTP ${r.code}"
+                val j = JSONObject(r.body!!.string())
+                val commit = j.optString("commit").takeIf { it.isNotEmpty() }?.let { " / $it" } ?: ""
+                true to "relay reachable: $shown  (version ${j.optString("version")}$commit, answered in " +
+                    "${System.currentTimeMillis() - t0} ms, active channels=${j.optInt("channels")})"
+            }
+        } catch (e: Exception) {
+            false to "relay NOT reachable at $shown: ${e.message ?: e.javaClass.simpleName}"
+        }
+    }
+
+    fun startUpload(backendUrl: String, channel: String): Upload = Upload(backendUrl, channel).also { it.connect() }
+
+    fun startDownload(backendUrl: String, channel: String, onBytes: (ByteArray) -> Unit): Download =
+        Download(backendUrl, channel, onBytes).also { it.connect() }
 }

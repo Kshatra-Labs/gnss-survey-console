@@ -5,6 +5,8 @@
      boards (Ardusimple, SparkFun, generic CP210x/CH340 breakouts) ship with,
      included so this isn't hard-locked to one specific board. -->
 <resources>
+    <!-- u-blox native USB (ZED-F9P USB port, any product ID) -->
+    <usb-device vendor-id="5446" /> <!-- 0x1546 -->
     <!-- FTDI FT231X / FT232R -->
     <usb-device vendor-id="1027" product-id="24597" /> <!-- 0x0403:0x6015 -->
     <usb-device vendor-id="1027" product-id="24577" /> <!-- 0x0403:0x6001 -->

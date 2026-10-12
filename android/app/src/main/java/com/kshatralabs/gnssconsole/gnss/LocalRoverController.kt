@@ -4,208 +4,86 @@ import android.content.Context
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
-import kotlin.math.cos
-import kotlin.math.hypot
-import kotlin.math.max
+import java.io.IOException
 
-data class Origin(val lat: Double, val lon: Double, val alt: Double)
-
-data class PointResult(
-    val label: String,
-    val latDeg: Double,
-    val lonDeg: Double,
-    val heightMslM: Double,
-    val n: Int,
-    val spreadM: Double,
-    val allFixed: Boolean,
-    val originE: Double? = null,
-    val originN: Double? = null,
-    val originU: Double? = null,
-    val cancelled: Boolean = false,
-)
-
-/** Drives the rover receiver plugged into this phone's USB-C/OTG port
- * directly - every byte of GNSS I/O happens locally against the USB device.
- * Only the RTCM3 correction stream comes from the network, via the cloud
- * relay (RelayClient) - the same channel-based hub the web console's Base
- * (USB) panel uploads to, so this rover can use corrections from a base
- * running on this phone, another phone, or a browser, interchangeably. */
-class LocalRoverController {
+/** Rover receiver on this phone's USB port: live monitor or point survey
+ * (RoverSession), with corrections from the cloud relay. `name` identifies
+ * it in PortLocks; a live monitor yields its receiver to a point survey. */
+class LocalRoverController(private val name: String, private val preemptible: Boolean) {
     var running: Boolean by mutableStateOf(false)
         private set
     var statusText: String by mutableStateOf("idle")
+        private set
+    var fixBadge: String? by mutableStateOf(null)
+        private set
+    var fixed: Boolean by mutableStateOf(false)
         private set
     var result: PointResult? by mutableStateOf(null)
         private set
     var error: String? by mutableStateOf(null)
         private set
-    var startError: String? by mutableStateOf(null)
-        private set
 
     @Volatile private var stopRequested = false
-    private var worker: Thread? = null
 
-    private fun setStatus(s: String) { statusText = s }
+    fun stop() { stopRequested = true }
 
-    fun stop() {
-        stopRequested = true
-    }
-
-    /** Multi-line "clearly labeled stats" block shown everywhere this rover
-     * is connected - relay link health (bytes actually flowing, how long
-     * ago) and the receiver's own fix stats. FIX=true means the carrier
-     * solution reached RTK FIXED, not just "has some position". */
-    private fun statsBlock(download: RelayClient.Download?, pvt: Ubx.NavPvt?): String {
-        val lines = ArrayList<String>()
-        if (download != null) {
-            val s = download.stats()
-            val age = if (s.ageS == null) "never" else "%.1fs ago".format(s.ageS)
-            lines.add("relay: ${if (download.connected()) "connected" else "reconnecting"}  bytes=${s.bytes}  last=$age")
-        }
-        if (pvt != null) {
-            lines.add(
-                "FIX=${pvt.carrSoln == 2}  (${Ubx.CARR_SOLN[pvt.carrSoln] ?: "?"}, fixType=${Ubx.FIX_TYPE[pvt.fixType] ?: pvt.fixType})  " +
-                    "sv=${pvt.numSv}  hAcc=${"%.3f".format(pvt.hAccM)}m  vAcc=${"%.3f".format(pvt.vAccM)}m"
-            )
-        } else {
-            lines.add("FIX: no NAV-PVT received yet")
-        }
-        return lines.joinToString("\n")
-    }
-
-    /** mode: "monitor" streams live status only; "point" also averages
-     * `durationS` seconds of fixes into a PointResult. */
-    private fun run(
-        context: Context, portRef: UsbPortRef, baud: Int,
-        backendUrl: String, channel: String,
-        mode: String, label: String, durationS: Double, requireFixed: Boolean, origin: Origin?,
-    ) {
+    private fun launch(context: Context, portRef: UsbPortRef, body: (UsbGnssConnection) -> Unit) {
+        if (running) return
         stopRequested = false
-        startError = null
         error = null
         result = null
+        fixBadge = null
         running = true
-        var conn: UsbGnssConnection? = null
-        var download: RelayClient.Download? = null
-        try {
-            setStatus("requesting USB permission...")
-            if (!UsbRover.requestPermissionBlocking(context, portRef.device)) {
-                throw IllegalStateException("USB permission denied for ${portRef.label}")
+        Thread {
+            var conn: UsbGnssConnection? = null
+            var locked = false
+            try {
+                statusText = "waiting for the receiver..."
+                PortLocks.acquire(portRef.key, name, preemptible, ::stop)?.let {
+                    throw SessionException("this receiver is already in use by: $it - stop that first")
+                }
+                locked = true
+                statusText = "requesting USB permission..."
+                if (!UsbRover.requestPermissionBlocking(context, portRef.device)) {
+                    throw SessionException("USB permission was not granted for ${portRef.label}")
+                }
+                statusText = "opening ${portRef.label}..."
+                conn = UsbRover.open(context, portRef)
+                val c = conn
+                if (!c.detectBaud { statusText = "detecting receiver: trying $it baud..." }) {
+                    throw SessionException("no u-blox reply at any baud rate (tried ${UsbGnssConnection.BAUD_CANDIDATES.joinToString()}) - is UBX enabled on this receiver's port?")
+                }
+                body(c)
+            } catch (e: SessionException) {
+                error = e.message
+            } catch (e: IOException) {
+                error = e.message
+            } catch (e: Exception) {
+                error = "${e.javaClass.simpleName}: ${e.message}"
+            } finally {
+                conn?.close()
+                if (locked) PortLocks.release(portRef.key, name)
+                fixBadge = null
+                running = false
             }
-            setStatus("opening ${portRef.label}...")
-            conn = UsbRover.open(context, portRef, baud)
-
-            setStatus("configuring rover...")
-            val okOut = conn.setMsgRateCurrentPort(Ubx.CLS_NAV, Ubx.NAV_PVT, 1)
-            val okIn = conn.enableRtcm3Input()
-            if (!okOut || !okIn) setStatus("warning: rover setup did not fully succeed (out=$okOut in=$okIn)")
-
-            val c = conn
-            download = RelayClient.startDownload(
-                backendUrl, channel,
-                onBytes = { bytes -> c.writeRtcmBytes(bytes) },
-                onStatus = { setStatus(it) },
-            )
-
-            if (mode == "monitor") {
-                setStatus("streaming")
-                while (!stopRequested) {
-                    val pvt = conn.readNavPvt(3000)
-                    setStatus(statsBlock(download, pvt))
-                }
-                result = PointResult(label, 0.0, 0.0, 0.0, 0, 0.0, false, cancelled = true)
-            } else {
-                setStatus("averaging ${durationS}s for '$label'")
-                val lats = ArrayList<Double>()
-                val lons = ArrayList<Double>()
-                val heights = ArrayList<Double>()
-                var allFixed = true
-                var framesSeen = 0
-                var bestCarrSoln = -1 // -1 = never saw a NAV-PVT at all
-                val deadline = System.nanoTime() + (durationS * 1e9).toLong()
-                while (System.nanoTime() < deadline && !stopRequested) {
-                    val remainingS = max(0.0, (deadline - System.nanoTime()) / 1e9)
-                    val pvt = conn.readNavPvt(3000)
-                    setStatus("[%.1fs left] collected=%d\n%s".format(remainingS, lats.size, statsBlock(download, pvt)))
-                    if (pvt == null) continue
-                    framesSeen++
-                    if (pvt.carrSoln > bestCarrSoln) bestCarrSoln = pvt.carrSoln
-                    if (pvt.carrSoln != 2) {
-                        allFixed = false
-                        if (requireFixed) continue
-                    }
-                    lats.add(pvt.latDeg)
-                    lons.add(pvt.lonDeg)
-                    heights.add(pvt.heightMslM)
-                }
-
-                if (stopRequested) {
-                    result = PointResult(label, 0.0, 0.0, 0.0, 0, 0.0, false, cancelled = true)
-                } else if (lats.isEmpty() && framesSeen == 0) {
-                    throw IllegalStateException(
-                        "no NAV-PVT messages received at all - receiver isn't talking UBX over this port " +
-                            "(check baud/wiring; this is NOT a corrections problem, nothing GNSS-related was ever read)"
-                    )
-                } else if (lats.isEmpty()) {
-                    val s = download.stats()
-                    val bytesNote = " relay bytes received=${s.bytes}"
-                    val cause = if (s.bytes == 0L)
-                        "Zero correction bytes arrived from the relay - check the Base is actually broadcasting and both sides use the same relay channel."
-                    else
-                        "Correction bytes are arriving but the fix never upgraded - check baseline distance and that the Base's own position is valid."
-                    throw IllegalStateException(
-                        "received $framesSeen fixes but corrections never reached RTK FIXED " +
-                            "(best carrier solution seen: ${Ubx.CARR_SOLN[bestCarrSoln] ?: "none"}).$bytesNote $cause"
-                    )
-                } else {
-                    val meanLat = lats.average()
-                    val meanLon = lons.average()
-                    val meanH = heights.average()
-                    val mPerDegLat = 111320.0
-                    val mPerDegLon = 111320.0 * cos(Math.toRadians(meanLat))
-                    var spread = 0.0
-                    for (i in lats.indices) {
-                        val d = hypot((lats[i] - meanLat) * mPerDegLat, (lons[i] - meanLon) * mPerDegLon)
-                        if (d > spread) spread = d
-                    }
-                    var originE: Double? = null
-                    var originN: Double? = null
-                    var originU: Double? = null
-                    if (origin != null && label != "origin") {
-                        val frame = Wgs84.LocalFrame(origin.lat, origin.lon, origin.alt)
-                        val (e, n, u) = frame.geodeticToEnu(meanLat, meanLon, meanH)
-                        originE = e; originN = n; originU = u
-                    }
-                    result = PointResult(label, meanLat, meanLon, meanH, lats.size, spread, allFixed, originE, originN, originU)
-                }
-            }
-        } catch (e: Exception) {
-            if (result == null) {
-                if (statusText.startsWith("requesting") || statusText.startsWith("opening")) {
-                    startError = "Can't start: ${e.message}"
-                } else {
-                    error = e.message
-                }
-            }
-        } finally {
-            download?.stop()
-            conn?.close()
-            running = false
-        }
+        }.apply { isDaemon = true; start() }
     }
 
-    fun startMonitor(context: Context, portRef: UsbPortRef, baud: Int, backendUrl: String, channel: String) {
-        worker = Thread {
-            run(context, portRef, baud, backendUrl, channel, "monitor", "monitor", 0.0, false, null)
-        }.also { it.isDaemon = true; it.start() }
-    }
+    private fun session(conn: UsbGnssConnection, portRef: UsbPortRef, backendUrl: String, channel: String) =
+        RoverSession(conn, portRef.label, backendUrl, channel, { stopRequested }, { statusText = it }, { pvt ->
+            fixBadge = fixBadgeText(pvt)
+            fixed = pvt?.carrSoln == 2
+        })
+
+    fun startMonitor(context: Context, portRef: UsbPortRef, backendUrl: String, channel: String) =
+        launch(context, portRef) { conn -> session(conn, portRef, backendUrl, channel).monitor() }
 
     fun startPoint(
-        context: Context, portRef: UsbPortRef, baud: Int, backendUrl: String, channel: String,
+        context: Context, portRef: UsbPortRef, backendUrl: String, channel: String,
         label: String, durationS: Double, requireFixed: Boolean, origin: Origin?,
-    ) {
-        worker = Thread {
-            run(context, portRef, baud, backendUrl, channel, "point", label, durationS, requireFixed, origin)
-        }.also { it.isDaemon = true; it.start() }
+    ) = launch(context, portRef) { conn ->
+        val r = session(conn, portRef, backendUrl, channel).point(label, durationS, requireFixed, origin)
+        result = r
+        statusText = if (r.cancelled) "cancelled" else "DONE \"${r.label}\": ${r.n} epochs averaged, fix=${r.allFixed}"
     }
 }

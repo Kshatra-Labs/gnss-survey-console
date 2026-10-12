@@ -32,6 +32,9 @@ android {
     buildFeatures {
         compose = true
     }
+    testOptions {
+        unitTests.isReturnDefaultValues = true
+    }
     composeOptions {
         kotlinCompilerExtensionVersion = "1.5.14"
     }
@@ -51,9 +54,11 @@ dependencies {
     // USB-C/OTG serial access to the rover receiver plugged into the phone directly
     // (FTDI/CP210x/CH34x chip support - covers the FT231X this project's receivers use).
     implementation("com.github.mik3y:usb-serial-for-android:3.7.0")
-    // JSON: org.json (built into the Android platform) rather than a codegen-based
-    // library - the server's status payloads are heterogeneous dicts, and org.json's
-    // JSONObject handles that with no schema/adapter to keep in sync.
+    // JSON: org.json, built into Android. Unit tests run on the plain JVM,
+    // where Android's copy is a stub, so they get the real library.
 
     debugImplementation("androidx.compose.ui:ui-tooling")
+
+    testImplementation("junit:junit:4.13.2")
+    testImplementation("org.json:json:20240303")
 }

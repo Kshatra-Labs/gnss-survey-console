@@ -4,17 +4,17 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
 
-    <!-- Rover receiver plugs into the phone's USB-C port (OTG) directly -->
+    <!-- Receivers plug into the phone's USB-C port (OTG) directly -->
     <uses-feature android:name="android.hardware.usb.host" android:required="true" />
 
     <application
         android:allowBackup="true"
+        android:icon="@drawable/ic_launcher"
         android:label="GNSS Survey Console"
         android:theme="@style/Theme.GnssConsole"
         android:usesCleartextTraffic="true">
-        <!-- cleartext allowed: Base control talks to a plain-http server on the
-             site's own LAN (no TLS cert to manage in the field), never the public
-             internet. The rover no longer needs this server at all - see USB below. -->
+        <!-- cleartext allowed only so a self-hosted relay on a local network
+             (http://192.168.x.x:8765) works; the default relay is HTTPS. -->
 
         <activity
             android:name=".MainActivity"

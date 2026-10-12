@@ -7,3 +7,8 @@ android/app/build/
 android/local.properties
 android/.idea/
 android/*.iml
+
+# test-only dependencies and generated outputs
+.test-deps/
+tests/oracle/js_frames.json
+tests/oracle/kt_frames.json

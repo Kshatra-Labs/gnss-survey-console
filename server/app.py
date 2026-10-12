@@ -1,13 +1,13 @@
-"""GNSS Survey Console - backend.
+"""GNSS Survey Console - cloud relay.
 
-This is now a pure byte relay plus the static page - it has no USB/serial
-access of its own. Base and Rover both run entirely in-browser (Web Serial)
-or in the Android app, each uploading/downloading RTCM3 bytes on a named
-channel; this process just rebroadcasts whatever the "base" role on a
-channel sends to every "rover" role connected to the same channel. Because
-it never touches hardware, this is the one piece of the system that could
-genuinely run on ordinary free cloud compute (Render, Fly.io, ...) instead
-of a machine wired to GPS receivers - see README for deploy notes.
+A pure byte relay plus the static page: no USB/serial access of its own.
+Base and Rover run entirely in the browser (Web Serial) or the Android app;
+on a named channel, whatever the "base" connection sends is rebroadcast to
+every "rover" connection.
+
+    GET  /healthz             liveness + version
+    GET  /status/{channel}    is a base live on this channel, how many rovers
+    WS   /ws/relay/{channel}?role=base|rover
 
 Run with:  python3 server/app.py [--host 0.0.0.0] [--port 8765]
 """
@@ -15,78 +15,151 @@ Run with:  python3 server/app.py [--host 0.0.0.0] [--port 8765]
 from __future__ import annotations
 
 import argparse
+import asyncio
 import os
+import time
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
-app = FastAPI(title="GNSS Survey Console")
+VERSION = "3"
+SEND_TIMEOUT_S = 5.0
+IDLE_CHANNEL_TTL_S = 600.0
 
-# The control page is hosted separately from this backend (GitHub Pages) -
-# CORS has to be open for its fetch()/WebSocket calls to reach here. There's
-# no user data or cookie-based auth on this API for a cross-origin request
-# to steal; the real access control is "do you know this backend's address"
-# (see README's security note).
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app = FastAPI(title="GNSS Survey Console relay")
+
+# The page is served from GitHub Pages, so CORS must be open. There's no
+# cookie auth or user data for a cross-origin request to steal; access
+# control is knowing the relay address and channel name (see README).
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 WEB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "web")
 
-# channel name -> {"base": WebSocket | None, "rovers": set[WebSocket]}
-_relay_channels: dict[str, dict] = {}
+
+class Channel:
+    def __init__(self) -> None:
+        # Newest base last. Only the newest is forwarded: a base that
+        # reconnects after a network blip supersedes its half-dead old
+        # socket, and two different bases never get interleaved into one
+        # unusable RTCM stream.
+        self.bases: list[WebSocket] = []
+        self.rovers: set[WebSocket] = set()
+        self.bytes_from_base = 0
+        self.last_base_data_at = 0.0
+        self.last_activity = time.monotonic()
+
+
+_channels: dict[str, Channel] = {}
+
+
+def _channel(name: str) -> Channel:
+    now = time.monotonic()
+    for key in [k for k, c in _channels.items()
+                if not c.bases and not c.rovers and now - c.last_activity > IDLE_CHANNEL_TTL_S]:
+        del _channels[key]
+    chan = _channels.setdefault(name, Channel())
+    chan.last_activity = now
+    return chan
+
+
+_background: set[asyncio.Task] = set()
+
+
+async def _close_quietly(ws: WebSocket) -> None:
+    try:
+        await asyncio.wait_for(ws.close(), SEND_TIMEOUT_S)
+    except Exception:
+        pass
+
+
+async def _send_or_drop(chan: Channel, rover: WebSocket, data: bytes) -> None:
+    try:
+        await asyncio.wait_for(rover.send_bytes(data), SEND_TIMEOUT_S)
+    except Exception:
+        chan.rovers.discard(rover)
+        # Close in the background: a stalled rover's close handshake is
+        # stuck behind the same full buffer, and awaiting it here would
+        # stall the base (and every other rover) along with it.
+        task = asyncio.create_task(_close_quietly(rover))
+        _background.add(task)
+        task.add_done_callback(_background.discard)
+
+
+@app.get("/healthz")
+def healthz() -> dict:
+    return {
+        "ok": True,
+        "service": "gnss-relay",
+        "version": VERSION,
+        "commit": os.environ.get("RENDER_GIT_COMMIT", "")[:7],
+        "channels": sum(1 for c in _channels.values() if c.bases or c.rovers),
+    }
+
+
+@app.get("/status/{channel}")
+def status(channel: str) -> dict:
+    chan = _channels.get(channel)
+    if chan is None:
+        return {"channel": channel, "base_online": False, "bases": 0, "rovers": 0,
+                "bytes_from_base": 0, "last_base_data_age_s": None}
+    return {
+        "channel": channel,
+        "base_online": bool(chan.bases),
+        "bases": len(chan.bases),
+        "rovers": len(chan.rovers),
+        "bytes_from_base": chan.bytes_from_base,
+        "last_base_data_age_s": (time.time() - chan.last_base_data_at) if chan.last_base_data_at else None,
+    }
 
 
 @app.websocket("/ws/relay/{channel}")
 async def ws_relay(websocket: WebSocket, channel: str, role: str = "rover") -> None:
+    if role not in ("base", "rover"):
+        await websocket.close(code=1008)
+        return
     await websocket.accept()
-    chan = _relay_channels.setdefault(channel, {"base": None, "rovers": set()})
+    chan = _channel(channel)
+
     if role == "base":
-        chan["base"] = websocket
+        chan.bases.append(websocket)
         try:
             while True:
-                data = await websocket.receive_bytes()
-                dead = set()
-                for r in chan["rovers"]:
-                    try:
-                        await r.send_bytes(data)
-                    except Exception:
-                        dead.add(r)
-                chan["rovers"] -= dead
-        except WebSocketDisconnect:
-            pass
+                msg = await websocket.receive()
+                if msg["type"] == "websocket.disconnect":
+                    break
+                data = msg.get("bytes")
+                if not data or chan.bases[-1] is not websocket:
+                    continue
+                chan.bytes_from_base += len(data)
+                chan.last_base_data_at = time.time()
+                chan.last_activity = time.monotonic()
+                if chan.rovers:
+                    await asyncio.gather(*(_send_or_drop(chan, r, data) for r in list(chan.rovers)))
         finally:
-            if chan["base"] is websocket:
-                chan["base"] = None
+            if websocket in chan.bases:
+                chan.bases.remove(websocket)
+            chan.last_activity = time.monotonic()
     else:
-        chan["rovers"].add(websocket)
+        chan.rovers.add(websocket)
         try:
             while True:
-                await websocket.receive_text()  # rovers never send anything meaningful; this just blocks until disconnect
-        except WebSocketDisconnect:
-            pass
+                msg = await websocket.receive()
+                if msg["type"] == "websocket.disconnect":
+                    break
         finally:
-            chan["rovers"].discard(websocket)
+            chan.rovers.discard(websocket)
+            chan.last_activity = time.monotonic()
 
 
-# Static files are mounted last (after the one real route above) so that
-# route takes precedence and only unmatched paths fall through to the
-# files. html=True serves index.html for "/" and every .js file at its own
-# root-relative path (app.js, gnss.js, ...), matching how GitHub Pages
-# serves the same directory flat - the page's <script src="..."> paths
-# work unchanged whichever one is actually serving it. Optional: a cloud
-# deploy of just this relay (see README) may not ship web/ at all, since
-# GitHub Pages already serves the page - don't fail startup over that.
+# Mounted last so the routes above take precedence. Optional: a relay-only
+# deploy may not ship web/, since GitHub Pages serves the page.
 if os.path.isdir(WEB_DIR):
     app.mount("/", StaticFiles(directory=WEB_DIR, html=True), name="web")
 else:
     @app.get("/")
     def root() -> dict:
-        return {"service": "gnss-survey-console relay", "status": "ok"}
+        return {"service": "gnss-relay", "version": VERSION}
 
 
 def main() -> None:
@@ -94,9 +167,6 @@ def main() -> None:
 
     p = argparse.ArgumentParser()
     p.add_argument("--host", default="0.0.0.0")
-    # Render (and most PaaS free tiers) assign the port via $PORT and route
-    # traffic to whatever that is - fall back to it before the local dev
-    # default so the same command works unchanged in both places.
     p.add_argument("--port", type=int, default=int(os.environ.get("PORT", 8765)))
     args = p.parse_args()
     uvicorn.run(app, host=args.host, port=args.port)
