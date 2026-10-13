@@ -55,9 +55,18 @@ else
 fi
 
 if [ -z "${SKIP_ANDROID:-}" ]; then
-  echo "== android (protocol vs reference, sessions end-to-end) =="
+  echo "== android (protocol vs reference, sessions end-to-end, result sync) =="
   (cd android && "$GRADLE" -p . :app:testDebugUnitTest --console=plain -q)
   PYTHONPATH="$DEPS/py" python3 tests/oracle/check_encoders.py tests/oracle/kt_frames.json
+
+  ADB=${ADB:-$(command -v adb || echo "${ANDROID_HOME:-$HOME/android-sdk}/platform-tools/adb")}
+  if [ -x "$ADB" ] && "$ADB" devices | grep -q "device$" && grep -q '"yaml"' tests/oracle/site_vectors.json; then
+    echo "== android app on a device/emulator (Site map tab, bridge, file picker) =="
+    (cd android && "$GRADLE" -p . :app:assembleDebug --console=plain -q)
+    ADB="$ADB" NODE_PATH="$DEPS/node/node_modules" node tests/android/site_in_app.js
+  else
+    echo "== android in-app test SKIPPED (no device/emulator attached) =="
+  fi
 fi
 
 echo

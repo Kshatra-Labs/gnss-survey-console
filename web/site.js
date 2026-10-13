@@ -1,10 +1,14 @@
-// Site map page. Sections: state | points | results | map + plot | aiming |
-// live rover | cameras.local.yaml. All math is in sitecalc.js.
+// Site map page. Sections: state | survey results (relay sync) | points |
+// results | map + plot | aiming | live rover | cameras.local.yaml.
+// All math is in sitecalc.js. Inside the Android app the same page runs in a
+// WebView, with window.AndroidSite for the relay address, the app's own
+// results, and opening/saving files.
 const $ = (id) => document.getElementById(id);
 const C = window.SiteCalc;
+const A = window.AndroidSite || null;
 
 const STATE_KEY = "gnss_site_v2";
-const RESULTS_KEY = "gnss_survey_results"; // written by the Survey console (app.js)
+const DEFAULT_RELAY = "https://gnss-relay.onrender.com";
 const COLORS = { origin: "#e6edf3", a: "#35c46b", b: "#f08a3c", ref: "#c58cff", live: "#4fa3ff" };
 
 // ================================================================ state
@@ -15,8 +19,11 @@ const store = {
 };
 const blankPoint = () => ({ lat: "", lon: "", h: "", mount: "", src: "" });
 
-let state = Object.assign({ ids: ["camera_a", "camera_b"], points: {}, refs: [], plan: { dist: "", bearing: "" }, decl: "", view: "map" },
+// The current site's points/refs/plan are on `state`; other channels' are kept in state.sites.
+let state = Object.assign({ ids: ["camera_a", "camera_b"], points: {}, refs: [], plan: { dist: "", bearing: "" }, decl: "", view: "map", channel: "", sites: {} },
   store.get(STATE_KEY) || {});
+const startChannel = (A && A.channel()) || state.channel ||
+  (() => { try { return localStorage.getItem("gnss_last_channel"); } catch (e) { return null; } })() || "default";
 const labels = () => ["origin", ...state.ids];
 for (const l of labels()) state.points[l] = Object.assign(blankPoint(), state.points[l] || {});
 const save = () => store.set(STATE_KEY, state);
@@ -95,7 +102,14 @@ function refCard(r, i) {
   name.value = r.name;
   name.addEventListener("input", () => { r.name = name.value; save(); update(); });
   const del = el("button", { class: "secondary", title: "remove" }, "remove");
-  del.onclick = () => { state.refs.splice(i, 1); save(); buildForms(); update(); };
+  del.onclick = () => {
+    state.refs.splice(i, 1);
+    if (r.at && Results.LABEL_RE.test(r.name)) { // a surveyed one: remove it everywhere, or the next sync brings it back
+      results = Results.merge(results, { [r.name]: Results.record(state.channel, r.name, { deleted: true }, A ? "Android app" : "site map") }).results;
+      syncNow();
+    }
+    save(); buildForms(); update();
+  };
   return el("div", { class: "pt", "data-ref": i }, [
     el("h3", {}, [el("span", { class: "dot", style: `background:${COLORS.ref}` }), name, del]),
     el("div", { class: "row" }, [field(r, "lat", "lat (°)", ""), field(r, "lon", "lon (°)", "")]),
@@ -109,42 +123,128 @@ function buildForms() {
   $("refForms").replaceChildren(...state.refs.map(refCard));
 }
 
-const surveyResults = () => store.get(RESULTS_KEY) || {};
+// ================================================================ survey results (relay sync)
 
-function fromSurvey(s) {
+const relayUrl = () => (A && A.relayUrl()) || (() => { try { return localStorage.getItem("gnss_server_url"); } catch (e) { return null; } })() || DEFAULT_RELAY;
+const appResults = (ch) => { if (!A) return {}; try { return JSON.parse(A.results(ch)) || {}; } catch (e) { return {}; } };
+
+let results = {};                       // merged: this device + the Android app + the relay
+let sync = { at: 0, error: null, reachable: null, live: false };
+
+const isHandEdited = (p) => /(edited\)|by hand)$|^from /.test(p.src || "");
+const newerThan = (r, p) => !p.at || Date.parse(r.at) > Date.parse(p.at);
+
+function fromSurvey(r) {
   return {
-    lat: s.lat_deg.toFixed(9), lon: s.lon_deg.toFixed(9), h: s.height_msl_m.toFixed(4), // 0.1 mm
-    sigma: s.spread_m, allFixed: s.all_fixed,
-    src: `survey ${new Date(s.at).toLocaleString()}: ${s.n} epochs, spread ${s.spread_m.toFixed(3)} m, fix=${s.all_fixed}`,
+    lat: r.lat_deg.toFixed(9), lon: r.lon_deg.toFixed(9), h: r.height_msl_m.toFixed(4), // 0.1 mm
+    sigma: r.spread_m, allFixed: r.all_fixed, at: r.at,
+    src: `survey ${new Date(r.at).toLocaleString()}${r.source ? ` (${r.source})` : ""}: ${r.n} epochs, spread ${r.spread_m.toFixed(3)} m, fix=${r.all_fixed}`,
   };
 }
 
-function showSurveyNote() {
-  const names = Object.keys(surveyResults());
-  $("surveyNote").textContent = names.length
-    ? `in this browser: ${names.join(", ")}`
-    : "no survey results in this browser yet - survey on the Survey console first, or type the values";
+/** Puts results into the points: new labels always; newer results only into
+ * points not edited by hand - unless forced ("Load survey results"). */
+function applyResults(force) {
+  let changed = false;
+  for (const [label, r] of Object.entries(results)) {
+    const isMain = labels().includes(label);
+    if (r.deleted) {
+      const i = state.refs.findIndex((x) => x.name === label);
+      if (i >= 0 && (force || !isHandEdited(state.refs[i])) && newerThan(r, state.refs[i])) { state.refs.splice(i, 1); changed = true; }
+      continue;
+    }
+    let p = isMain ? state.points[label] : state.refs.find((x) => x.name === label);
+    if (!p) state.refs.push(p = { name: label, above: "" });
+    if (force || ((!p.lat || !isHandEdited(p)) && newerThan(r, p))) { Object.assign(p, fromSurvey(r)); changed = true; }
+  }
+  if (changed) { mapFitted = false; save(); buildForms(); update(); }
+  return changed;
 }
 
-$("loadSurvey").onclick = () => {
-  const r = surveyResults();
-  for (const [label, s] of Object.entries(r)) {
-    if (labels().includes(label)) {
-      Object.assign(state.points[label], fromSurvey(s));
-    } else { // any other label is a reference point
-      let ref = state.refs.find((x) => x.name === label);
-      if (!ref) state.refs.push(ref = { name: label, above: "" });
-      Object.assign(ref, fromSurvey(s));
+function renderSyncNote() {
+  const names = Object.keys(results).filter((k) => !results[k].deleted);
+  const parts = [names.length ? `${names.length} result(s): ${names.join(", ")}` : "no results on this channel yet"];
+  if (sync.reachable === false) parts.push(`relay unreachable (${sync.error}) - showing what this device has`);
+  else if (sync.at) parts.push(`synced ${new Date(sync.at).toLocaleTimeString()}${sync.error ? ` (${sync.error})` : ""}`);
+  else parts.push("syncing with the relay...");
+  parts.push(sync.live ? "live link on" : "live link connecting");
+  $("syncNote").textContent = parts.join(" · ");
+  $("syncNote").className = "src" + (sync.reachable === false ? " bad" : "");
+}
+
+let syncRun = 0;
+async function syncNow() {
+  const ch = state.channel, run = ++syncRun;
+  const r = await Results.sync(relayUrl(), ch, appResults(ch));
+  if (ch !== state.channel || run !== syncRun) return; // channel changed meanwhile
+  results = r.results;
+  sync = { ...sync, at: r.reachable ? Date.now() : sync.at, error: r.error, reachable: r.reachable };
+  applyResults(false);
+  renderSyncNote();
+}
+
+let watch = null;
+function startWatch() {
+  if (watch) watch.stop();
+  sync.live = false;
+  watch = window.startRelayWatch(relayUrl(), state.channel, (ev) => {
+    if (ev.type === "pvt") setLive(ev);
+    else if (ev.type === "result" && Results.LABEL_RE.test(ev.label)) {
+      const m = Results.merge(results, { [ev.label]: ev.result });
+      if (!m.changed.length) return;
+      results = m.results;
+      Results.saveLocal(state.channel, results);
+      applyResults(false);
+      renderSyncNote();
     }
-  }
-  const n = Object.keys(r).length;
-  $("surveyNote").textContent = n ? `loaded ${n} survey result(s): ${Object.keys(r).join(", ")}` : "no survey results in this browser yet";
+  }, (up) => { sync.live = up; renderSyncNote(); });
+}
+
+function switchSite(ch) {
+  if (state.channel) state.sites[state.channel] = { ids: state.ids, points: state.points, refs: state.refs, plan: state.plan };
+  const s = state.sites[ch] || {};
+  delete state.sites[ch];
+  Object.assign(state, { channel: ch, ids: s.ids || ["camera_a", "camera_b"], points: s.points || {}, refs: s.refs || [], plan: s.plan || { dist: "", bearing: "" } });
+  for (const l of labels()) state.points[l] = Object.assign(blankPoint(), state.points[l] || {});
+  $("planDist").value = state.plan.dist; $("planBearing").value = state.plan.bearing;
   mapFitted = false;
-  save(); buildForms(); update();
+  buildForms();
+}
+
+function useChannel(ch) {
+  if (ch !== state.channel) switchSite(ch);
+  save();
+  results = Results.merge(Results.loadLocal(ch), appResults(ch)).results; // instant, before the relay answers
+  sync = { at: 0, error: null, reachable: null, live: false };
+  applyResults(false);
+  renderSyncNote();
+  startWatch();
+  syncNow();
+}
+
+$("channel").value = startChannel;
+let channelTimer = null;
+$("channel").addEventListener("input", () => {
+  clearTimeout(channelTimer);
+  const ch = $("channel").value.trim();
+  if (ch) channelTimer = setTimeout(() => useChannel(ch), 600);
+});
+setInterval(syncNow, 30000); // also keeps a free-tier relay awake while the page is open
+
+$("loadSurvey").onclick = async () => {
+  await syncNow();
+  applyResults(true);
 };
 
+// the console in this browser saved a result
+window.addEventListener("storage", (e) => {
+  if (e.key !== `gnss_results:${state.channel}`) return;
+  const m = Results.merge(results, Results.loadLocal(state.channel));
+  if (m.changed.length) { results = m.results; applyResults(false); renderSyncNote(); syncNow(); }
+});
+
 $("clearPoints").onclick = () => {
-  if (!confirm("Clear all points on this page? (Survey results stay saved in the console.)")) return;
+  if (!confirm("Clear all points on this page? (Survey results stay on the relay and in the console; \"Load survey results\" brings them back.)")) return;
   for (const l of labels()) state.points[l] = blankPoint();
   state.refs = [];
   save(); buildForms(); update();
@@ -402,7 +502,10 @@ window.addEventListener("resize", () => update());
 
 async function copyText(text, btn) {
   const label = btn.textContent;
-  try { await navigator.clipboard.writeText(text); btn.textContent = "copied"; }
+  try {
+    if (A) A.copy(text); else await navigator.clipboard.writeText(text);
+    btn.textContent = "copied";
+  }
   catch (e) { btn.textContent = "copy failed"; }
   setTimeout(() => { btn.textContent = label; }, 1500);
 }
@@ -429,18 +532,18 @@ function renderAim(an) {
 
 // ================================================================ live rover (from the console tab)
 
+// From the console in this browser (BroadcastChannel), any device through
+// the relay (watch link), or the Android app hosting this page.
 let live = null;
+function setLive(m) {
+  if (!m || m.type !== "pvt" || !Number.isFinite(m.lat) || !Number.isFinite(m.lon)) return;
+  live = { ...m, receivedAt: Date.now() - (m.age_s || 0) * 1000, fresh: true };
+  update();
+}
 const liveChannel = "BroadcastChannel" in window ? new BroadcastChannel("gnss-live") : null;
 if (liveChannel) {
-  liveChannel.onmessage = (ev) => {
-    const m = ev.data;
-    if (!m || m.type !== "pvt" || !Number.isFinite(m.lat) || !Number.isFinite(m.lon)) return;
-    live = { ...m, receivedAt: Date.now(), fresh: true };
-    update();
-  };
+  liveChannel.onmessage = (ev) => setLive(ev.data);
   window.addEventListener("pagehide", () => liveChannel.close());
-} else {
-  $("liveOut").textContent = "this browser can't share the rover between tabs (no BroadcastChannel)";
 }
 setInterval(() => { if (live && live.fresh && Date.now() - live.receivedAt > 4000) { live.fresh = false; update(); } }, 1000);
 
@@ -461,16 +564,15 @@ function renderLive(an, site) {
     sel.dataset.keys = keys;
     if (ts.some((t) => t.key === prev)) sel.value = prev;
   }
-  if (!liveChannel) return;
   const out = $("liveOut");
-  if (!live) { out.textContent = "waiting for the console's rover... (Survey console tab, rover connected, Live monitor running)"; return; }
+  if (!live) { out.textContent = `waiting for a rover on channel "${state.channel}" (web console or Android app, Live monitor or a point survey running)...`; return; }
   const age = ((Date.now() - live.receivedAt) / 1000).toFixed(1);
   const fixed = live.carrSoln === 2;
   const lines = [
     el("div", { class: live.fresh ? (fixed ? "fix-true" : "fix-false") : "stale" }, live.fresh
       ? `FIX=${fixed}  ${["no RTK", "RTK FLOAT", "RTK FIXED"][live.carrSoln] ?? "?"}  hAcc=${fmt(live.hAccM, 3)} m  sv=${live.numSv ?? "?"}  (${age}s ago)`
       : `no rover update for ${age}s - is the console's Live monitor still running?`),
-    el("div", {}, `rover: lat ${live.lat.toFixed(9)}  lon ${live.lon.toFixed(9)}  h ${fmt(live.h, 3)} m`),
+    el("div", {}, `rover${live.source ? ` (${live.source})` : ""}: lat ${live.lat.toFixed(9)}  lon ${live.lon.toFixed(9)}  h ${fmt(live.h, 3)} m`),
   ];
   const t = ts.find((x) => x.key === sel.value);
   if (!t) {
@@ -517,6 +619,7 @@ function setConfig(text, name, handle) {
 }
 
 $("cfgOpen").onclick = async () => {
+  if (A) { A.openConfig(); return; } // Android file picker; answers via siteAndroid.configOpened
   if (!window.showOpenFilePicker) { $("cfgFile").click(); return; } // no File System Access API: open, then download
   let handle;
   try {
@@ -555,6 +658,7 @@ $("cfgWrite").onclick = () => {
 };
 
 $("cfgSave").onclick = async () => {
+  if (A) { cfgMsg("saving..."); A.saveConfig(cfg.pending); return; } // answers via siteAndroid.configSaved
   try {
     const w = await cfg.handle.createWritable();
     await w.write(cfg.pending);
@@ -569,6 +673,7 @@ $("cfgSave").onclick = async () => {
   }
 };
 $("cfgDownload").onclick = () => {
+  if (A) { A.saveConfigAs(cfg.pending); return; }
   const a = el("a", { href: URL.createObjectURL(new Blob([cfg.pending], { type: "text/yaml" })), download: "cameras.local.yaml" });
   document.body.append(a); a.click(); a.remove();
   setTimeout(() => URL.revokeObjectURL(a.href), 1000);
@@ -606,9 +711,26 @@ function update() {
   $("snippet").textContent = C.configSnippet(an, site.origin);
 }
 
-window.addEventListener("storage", (e) => { if (e.key === RESULTS_KEY) showSurveyNote(); });
+// ================================================================ Android app hooks
+
+window.siteAndroid = {
+  pvt: (m) => setLive(m),
+  // the app's channel changed (Survey tab)
+  useChannel: (ch) => { if (ch && ch !== state.channel) { $("channel").value = ch; useChannel(ch); } },
+  resultsChanged: () => syncNow(),
+  configOpened: (name, text) => setConfig(text, name, "android"),
+  configError: (msg) => cfgMsg(msg, "bad"),
+  configSaved: (ok, msg) => {
+    if (!ok) { cfgMsg(`could not save (${msg})`, "bad"); return; }
+    cfg.text = cfg.pending; cfg.pending = null;
+    $("cfgSaveRow").style.display = "none";
+    cfgMsg(msg || `saved ${cfg.name} and read it back - it holds the survey now`, "good");
+  },
+};
+
+if (A) document.querySelector(".nav").hidden = true; // in the app, the console is the Survey tab
 
 initMap();
 buildForms();
-showSurveyNote();
+useChannel(startChannel);
 setView(state.view === "plot" || !map ? "plot" : "map"); // no map library (offline): the exact plot

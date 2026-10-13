@@ -37,6 +37,9 @@ async function checkRelay() {
     clearTimeout(t);
   }
   if (seq !== relayCheckSeq) return; // a newer check (address changed) owns the display
+  if (!isErr) { // upload anything surveyed while the relay was unreachable
+    try { const c = localStorage.getItem(LAST_CHANNEL_KEY); if (c) syncResults(c); } catch (e) { /* no storage */ }
+  }
   el.className = isErr ? "status inline err" : "status inline";
   el.textContent = msg;
   if (isErr) el.closest("details").open = true; // show the address to fix
@@ -193,23 +196,43 @@ function diagnoseNoFix(framesSeen, bestCarr, link, channel, requireFixed) {
     (requireFixed ? ", or untick FIXED-only to accept FLOAT." : ".");
 }
 
-// Shared with the Site map page (site.html) in this browser: finished point
-// results are kept per label, and the rover's live fix is broadcast to it.
-const RESULTS_KEY = "gnss_survey_results";
+// Finished point results go to the Site map on any device: kept on this
+// device per channel (Results, results.js) and uploaded to the relay. The
+// rover's live fix goes to a Site map in this browser (BroadcastChannel)
+// and, through the relay, anywhere else.
+const LAST_CHANNEL_KEY = "gnss_last_channel";
 const liveChannel = "BroadcastChannel" in window ? new BroadcastChannel("gnss-live") : null;
 
-function saveSurveyResult(r) {
-  try {
-    const all = JSON.parse(localStorage.getItem(RESULTS_KEY) || "{}");
-    all[r.label] = { lat_deg: r.lat_deg, lon_deg: r.lon_deg, height_msl_m: r.height_msl_m, n: r.n, spread_m: r.spread_m, all_fixed: r.all_fixed, at: new Date().toISOString() };
-    localStorage.setItem(RESULTS_KEY, JSON.stringify(all));
-    return true;
-  } catch (e) { return false; } // private mode: the result is still on screen
+function rememberChannel(channel) {
+  try { localStorage.setItem(LAST_CHANNEL_KEY, channel); } catch (e) { /* private mode */ }
 }
 
+/** Stores a result on this device (synchronously) and starts uploading it.
+ * onSync(text, ok) reports the upload. Returns false if nothing could be stored. */
+function saveSurveyResult(r, channel, onSync) {
+  channel = channel || $("usbChannel").value.trim() || "default";
+  rememberChannel(channel);
+  try {
+    Results.record(channel, r.label, { lat_deg: r.lat_deg, lon_deg: r.lon_deg, height_msl_m: r.height_msl_m, n: r.n, spread_m: r.spread_m, all_fixed: r.all_fixed }, "web console");
+  } catch (e) { return false; }
+  syncResults(channel).then((res) => onSync && onSync(res.error
+    ? `not on the relay yet (${res.error}) - kept on this device, retried automatically`
+    : `on the relay: the Site map on any device sees it (channel "${channel}")`, !res.error));
+  return true;
+}
+
+let syncing = Promise.resolve();
+function syncResults(channel) {
+  syncing = syncing.then(() => Results.sync(serverUrl, channel));
+  return syncing;
+}
+// retry anything not yet uploaded (relay asleep / offline when surveyed)
+setInterval(() => { try { const c = localStorage.getItem(LAST_CHANNEL_KEY); if (c) syncResults(c); } catch (e) { /* no storage */ } }, 60000);
+
 function shareLive(pvt) {
-  if (!liveChannel || !pvt || pvt.fixType < 2) return;
-  liveChannel.postMessage({ type: "pvt", lat: pvt.latDeg, lon: pvt.lonDeg, h: pvt.heightMslM, carrSoln: pvt.carrSoln, hAccM: pvt.hAccM, numSv: pvt.numSv, at: Date.now() });
+  if (!pvt || pvt.fixType < 2) return;
+  if (liveChannel) liveChannel.postMessage({ type: "pvt", lat: pvt.latDeg, lon: pvt.lonDeg, h: pvt.heightMslM, carrSoln: pvt.carrSoln, hAccM: pvt.hAccM, numSv: pvt.numSv, source: "web console (this browser)" });
+  if (usbLink && usbLink.sendPvt) usbLink.sendPvt(pvt, "web console");
 }
 
 function renderPointResult(el, r) {
@@ -223,16 +246,21 @@ function renderPointResult(el, r) {
   const code = document.createElement("code");
   code.textContent = text;
   el.replaceChildren(code);
-  if (saveSurveyResult(r)) {
-    const note = document.createElement("small");
-    note.className = "hint";
-    note.append(`saved as "${r.label}" for the `);
+  const note = document.createElement("small");
+  note.className = "hint";
+  const sync = document.createElement("span");
+  sync.className = "sync";
+  sync.textContent = "uploading to the relay...";
+  const ok = saveSurveyResult(r, null, (t, good) => { sync.textContent = t; sync.style.color = good ? "var(--good)" : "var(--warn)"; });
+  if (ok) {
     const a = document.createElement("a");
     a.href = "site.html"; a.target = "_blank"; a.textContent = "Site map";
     a.style.color = "var(--accent)";
-    note.append(a, " (distance and bearing between the poles)");
-    el.append(note);
+    note.append(`saved as "${r.label}" for the `, a, " - ", sync);
+  } else {
+    note.append("could not save it on this device (private browsing?) - copy the values above");
   }
+  el.append(note);
   if (r.label === "origin") {
     $("originLat").value = r.lat_deg.toFixed(9);
     $("originLon").value = r.lon_deg.toFixed(9);
@@ -275,6 +303,7 @@ async function usbRunSession(mode) {
   if (!conn || !conn.alive) { setStatus("usb", "connect a USB receiver first", true); return; }
   const channel = $("usbChannel").value.trim() || "default";
   const label = $("usbLabel").value.trim() || "point";
+  if (mode === "point" && !Results.LABEL_RE.test(label)) { setStatus("usb", "label: letters, digits, _ . - only (e.g. camera_a)", true); return; }
   const durationS = parseFloat($("usbDuration").value);
   const requireFixed = $("usbRequireFixed").checked;
   let origin = null;

@@ -38,6 +38,9 @@ android {
     composeOptions {
         kotlinCompilerExtensionVersion = "1.5.14"
     }
+    // The Site map tab is the web page itself (web/site.html and its scripts),
+    // bundled so it is the same page, same math, as the hosted one.
+    sourceSets["main"].assets.srcDir("../../web")
 }
 
 dependencies {
@@ -51,6 +54,7 @@ dependencies {
 
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
+    implementation("androidx.webkit:webkit:1.11.0") // WebViewAssetLoader: serves the bundled page over https
     // USB-C/OTG serial access to the rover receiver plugged into the phone directly
     // (FTDI/CP210x/CH34x chip support - covers the FT231X this project's receivers use).
     implementation("com.github.mik3y:usb-serial-for-android:3.7.0")

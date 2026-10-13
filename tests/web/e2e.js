@@ -56,7 +56,9 @@ async function loadPage(pageUrl, opts = {}) {
     pretendToBeVisual: true,
     beforeParse(win) {
       Object.defineProperty(win.navigator, "serial", { value: serial, configurable: true });
-      win.BroadcastChannel = BroadcastChannel; // Node's: shared by every page in this process, like tabs of one browser
+      // Node's BroadcastChannel is shared by every page in this process, like
+      // tabs of one browser; leave it out to make a page act like another device.
+      if (!opts.otherDevice) win.BroadcastChannel = BroadcastChannel;
       for (const [k, v] of Object.entries(opts.storage || {})) win.localStorage.setItem(k, v);
       win.fetch = (u, o = {}) => fetch(u, { ...o, signal: undefined });
       win.console.error = (...a) => console.error("  [page error]", ...a);
@@ -112,6 +114,7 @@ async function main() {
     relay = await startRelay(relayPort);
   }
   const relayUrl = external || relay.url;
+  const SITE = "e2e-" + Math.random().toString(36).slice(2, 8); // never the real "default" channel on a live relay
   const pageUrl = argVal("--page") || relayUrl + "/";
   console.log(`page: ${pageUrl}\nrelay: ${relayUrl}`);
 
@@ -175,7 +178,7 @@ async function main() {
   log(`no base on channel -> ${text(p, "usbStatus").slice(0, 170)}...`);
 
   // ---- base: survey-in -> broadcasting ----
-  p.$("baseUsbChannel").value = "site-a";
+  p.$("baseUsbChannel").value = SITE;
   p.$("baseUsbMinDur").value = "5";
   p.$("baseUsbAccLimit").value = "2.0";
   p.$("baseUsbStart").click();
@@ -191,7 +194,7 @@ async function main() {
   log("base broadcasting:\n      " + text(p, "baseUsbStatus").split("\n").join("\n      "));
 
   // ---- rover live monitor reaches FIX=true ----
-  p.$("usbChannel").value = "site-a";
+  p.$("usbChannel").value = SITE;
   p.$("usbMonitor").click();
   await waitFor(p, () => /FIX=true\s+RTK FIXED/.test(text(p, "usbStatus")), 30000, "monitor FIX=true");
   assert.match(text(p, "usbStatus"), /corrections used=true/);
@@ -267,19 +270,25 @@ async function main() {
   p.$("usbStart").click();
   await waitFor(p, () => /DONE "camera_b"/.test(text(p, "usbStatus")) || /ERROR/.test(text(p, "usbStatus")), 30000, "camera_b survey");
   assert.match(text(p, "usbResult"), /saved as "camera_b" for the Site map/);
-  const saved = JSON.parse(p.win.localStorage.getItem("gnss_survey_results"));
+  await waitFor(p, () => /on the relay: the Site map on any device sees it/.test(text(p, "usbResult")), 20000, "result uploaded");
+  const saved = JSON.parse(p.win.localStorage.getItem(`gnss_results:${SITE}`));
   assert.deepEqual(Object.keys(saved).sort(), ["camera_a", "camera_b", "origin"]);
+  const onRelay = (await (await fetch(`${relayUrl}/results/${SITE}`)).json()).results;
+  assert.deepEqual(onRelay, saved, "the relay holds exactly what the console recorded");
   for (const k of Object.keys(saved)) assert.equal(saved[k].all_fixed, true, k);
   assert.ok(Math.abs(saved.camera_b.lat_deg - bLat) < 2e-7 && Math.abs(saved.camera_b.lon_deg - bLon) < 2e-7, "camera_b saved position");
   assert.ok(liveSeen.length > 0 && liveSeen.every((m) => m.type === "pvt" && Number.isFinite(m.lat)), "console broadcasts live fixes");
-  log(`console saved origin/camera_a/camera_b for the Site map and broadcast ${liveSeen.length} live fixes`);
+  log(`console saved origin/camera_a/camera_b, uploaded them to the relay, and broadcast ${liveSeen.length} live fixes`);
 
-  const sitePage = await loadPage(new URL("site.html", pageUrl).href, { storage: { gnss_survey_results: JSON.stringify(saved) } });
+  // the Site map as ANOTHER device: empty storage, no tab channel - everything through the relay
+  const sitePage = await loadPage(new URL("site.html", pageUrl).href, { otherDevice: true, storage: { gnss_server_url: relayUrl } });
   const s$ = sitePage.$;
   assert.match(s$("mapNote").textContent, /couldn't load/, "no Leaflet -> fallback note, page still works");
   assert.equal(s$("plotView").hidden, false, "no map library -> the exact plot is shown instead");
-  assert.match(s$("surveyNote").textContent, /in this browser: origin, camera_a, camera_b/);
-  s$("loadSurvey").click();
+  s$("channel").value = SITE; s$("channel").dispatchEvent(new sitePage.win.Event("input"));
+  await waitFor(sitePage, () => /Distance/.test(s$("pairOut").textContent), 20000, "results arrive on the other device by themselves");
+  assert.match(s$("syncNote").textContent, /3 result\(s\): .*camera_a.*synced/);
+  assert.match(sitePage.$("pointForms").textContent, /survey .*\(web console\): \d+ epochs/);
   const site = {
     origin: { lat: saved.origin.lat_deg, lon: saved.origin.lon_deg, h: saved.origin.height_msl_m },
     poles: Object.fromEntries(["camera_a", "camera_b"].map((k) => [k, { lat: saved[k].lat_deg, lon: saved[k].lon_deg, h: saved[k].height_msl_m, mount: 0 }])),
@@ -297,7 +306,8 @@ async function main() {
   const row = [...s$("pairOut").querySelectorAll("tr")].map((tr) => [...tr.children].map((td) => td.textContent)).find((r) => r[0] === "camera_b");
   assert.ok(row, "camera_b row in the table");
   row.slice(1, 4).map(Number).forEach((v, i) => assert.ok(Math.abs(v - an.poles.camera_b.enu[i]) < 1e-3, `camera_b origin_e/n/u ${row} vs ${an.poles.camera_b.enu}`));
-  assert.equal(s$("plot").querySelectorAll("circle").length, 3, "site plot draws origin + 2 poles");
+  const plotLabels = [...s$("plot").querySelectorAll("text")].map((t) => t.textContent);
+  for (const l of ["origin", "camera_a", "camera_b"]) assert.ok(plotLabels.includes(l), `site plot draws ${l}: ${plotLabels}`);
   log(`Site map: ${an.pair.horizM.toFixed(3)} m at ${an.pair.trueBearingAB.toFixed(3)}° between the poles (truth ~${truthDist.toFixed(3)} m)`);
 
   // plan + corrections
@@ -314,7 +324,8 @@ async function main() {
   const liveText = s$("liveOut").textContent;
   const off = /camera_b \(surveyed\): (in place|(\d+\.\d+) m)/.exec(liveText);
   assert.ok(off && (off[1] === "in place (< 1 mm)" || Number(off[2]) < 0.02), `rover at camera_b should be ~0 m away:\n${liveText}`);
-  log("live rover from the console tab -> " + s$("liveOut").querySelector(".big").textContent);
+  assert.match(liveText, /rover \(web console\)/, "came through the relay, not a tab channel");
+  log("live rover via the relay on another device -> " + s$("liveOut").querySelector(".big").textContent);
   p.$("usbStop").click();
   await waitFor(p, () => /monitor stopped/.test(text(p, "usbStatus")) && !p.$("usbStart").disabled, 10000, "monitor stops");
   listener.close();
@@ -341,7 +352,7 @@ async function main() {
   assert.match(outYaml, /camera_a:\n      host: "x"\n      origin_e: [-\d.]+\n/, "unrelated lines untouched");
   assert.match(outYaml, /origin_u: [-\d.]+  # m\n/, "comments kept");
   log("Site map wrote origin + both poles + pole_distance_m: 0.0 into a pasted config");
-  sitePage.win.eval("liveChannel.close()"); // Node's BroadcastChannel outlives a closed jsdom window; a browser tab's doesn't
+  sitePage.win.eval("watch.stop()");
   sitePage.win.close();
 
   // ---- FLOAT-only conditions ----

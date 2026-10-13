@@ -2,6 +2,8 @@ package com.kshatralabs.gnssconsole.gnss
 
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
@@ -218,10 +220,21 @@ object RelayClient {
     }
 
     /** Rover side: every chunk from the relay goes to onBytes (the
-     * receiver), with CRC-valid RTCM3 frames counted by type on the way. */
+     * receiver), with CRC-valid RTCM3 frames counted by type on the way.
+     * The rover's live fix goes back up as JSON text, for the Site map. */
     class Download(backendUrl: String, channel: String, private val onBytes: (ByteArray) -> Unit) :
         Link(backendUrl, channel, "rover") {
         val rtcmIn = Rtcm.Scanner()
+        @Volatile private var lastPvtSent = 0L
+
+        /** At most once a second; skipped while the link is down. */
+        fun sendPvt(pvt: Ubx.NavPvt?, source: String) {
+            val s = socket
+            val now = System.currentTimeMillis()
+            if (pvt == null || pvt.fixType < 2 || !isOpen || s == null || now - lastPvtSent < 1000) return
+            lastPvtSent = now
+            s.send(pvtJson(pvt, source).toString())
+        }
 
         override fun onBinary(data: ByteArray) {
             bytes.addAndGet(data.size.toLong())
@@ -231,6 +244,29 @@ object RelayClient {
         }
 
         fun statsLine(): String = linkLine("received")
+    }
+
+    fun pvtJson(pvt: Ubx.NavPvt, source: String): JSONObject = JSONObject()
+        .put("type", "pvt").put("lat", pvt.latDeg).put("lon", pvt.lonDeg).put("h", pvt.heightMslM)
+        .put("carrSoln", pvt.carrSoln).put("hAccM", pvt.hAccM).put("numSv", pvt.numSv).put("source", source)
+
+    private fun resultsUrl(backendUrl: String, channel: String, label: String? = null): HttpUrl =
+        baseUrl(backendUrl).newBuilder().addPathSegment("results").addPathSegment(channel)
+            .apply { if (label != null) addPathSegment(label) }.build()
+
+    /** GET /results/{channel}: label -> result. Blocking; throws IOException. */
+    fun getResults(backendUrl: String, channel: String): JSONObject =
+        httpClient.newCall(Request.Builder().url(resultsUrl(backendUrl, channel)).build()).execute().use { r ->
+            if (!r.isSuccessful) throw IOException("HTTP ${r.code}")
+            JSONObject(r.body!!.string()).optJSONObject("results") ?: JSONObject()
+        }
+
+    /** PUT /results/{channel}/{label}. Blocking; throws IOException. */
+    fun putResult(backendUrl: String, channel: String, label: String, result: JSONObject) {
+        val body = result.toString().toRequestBody("application/json".toMediaType())
+        httpClient.newCall(Request.Builder().url(resultsUrl(backendUrl, channel, label)).put(body).build()).execute().use { r ->
+            if (!r.isSuccessful) throw IOException("HTTP ${r.code}")
+        }
     }
 
     private val healthClient = OkHttpClient.Builder()

@@ -1,9 +1,11 @@
 # GNSS Survey Console
 
 Centimetre-accurate RTK surveying with two u-blox F9P receivers, straight
-from USB in a browser (or the Android app), and the result written into
+from USB in a browser or the Android app, and the result written into
 Ground_EO_Tracker's `cameras.local.yaml`. This is the only survey tool for
-that project.
+that project. Every device on the same **channel** shares the survey through
+the relay: a point surveyed in the app shows up in the Site map on a laptop,
+and the other way round.
 
 **https://kshatra-labs.github.io/gnss-survey-console/** - Chrome or Edge
 (Web Serial isn't in Firefox/Safari). Nothing to install or configure.
@@ -19,9 +21,9 @@ that project.
    - `camera_a`, `camera_b` - at each pole;
    - anything else (`mast`, `stake1`, ...) - reference points the cameras can
      sight, for north alignment.
-4. Open the **Site map** tab:
-   - **Load survey results**, then enter each camera's **mount** height (the
-     camera above the surveyed spot);
+4. Open the **Site map** tab (website or app), on the same channel:
+   - the points arrive by themselves; enter each camera's **mount** height
+     (the camera above the surveyed spot);
    - check the pole distance and bearing;
    - **cameras.local.yaml**: **Open file...**, **Write survey into it** (it
      lists every changed line), **Save to the file**.
@@ -55,11 +57,28 @@ paste into the sightings file.
 - **Corrections vs plan** (optional) - give the planned `pole_distance_m` /
   `pole_line_bearing_deg`, and it says how far, and which way, to move each
   pole.
-- **Live rover** - with the console's Live monitor running in another tab, it
-  gives directions ("0.31 m towards 172°") to any planned or surveyed spot.
+- **Live rover** - any rover on the channel (web or app, any device) shows
+  live, with directions ("0.31 m towards 172°") to any planned or surveyed
+  spot.
 
-The page works on the points in your browser; nothing is uploaded. The map
-needs internet; without it the exact plot and every number still work.
+Results and live fixes travel through the relay. Nothing else is uploaded:
+the config file is only read and written on your device. The map needs
+internet; without it the exact plot and every number still work.
+
+### How results are shared
+
+- Every finished point is kept **on the device that surveyed it** (per
+  channel) and uploaded to the relay. The Site map pulls the channel's
+  results, takes new ones automatically, and listens for new ones.
+- **Newest wins:** a point surveyed again replaces the older one everywhere.
+  A point you edited by hand in the Site map is never overwritten
+  automatically; **Load survey results** forces the latest.
+- **Removing a reference point** removes it on every device.
+- **The relay keeps results only in memory.** The free host forgets them
+  when it sleeps, so every device keeps its own copy and re-uploads it on
+  the next sync (every minute, and whenever a page or the app opens).
+- **No sign-in:** anyone who knows a channel name can read it, so use a
+  non-obvious channel for a real site.
 
 ## Status lines
 
@@ -88,8 +107,10 @@ push to `main`. GitHub Pages serves `web/` (`.github/workflows/pages.yml`).
 | | |
 |---|---|
 | `GET /healthz` | liveness + version |
-| `GET /status/{channel}` | base online?, bases/rovers, bytes, age of last base data |
-| `WS /ws/relay/{channel}?role=base\|rover` | the relay |
+| `GET /status/{channel}` | base online?, bases/rovers/watchers, bytes, age of last base data, results |
+| `GET /results/{channel}` | the channel's survey results |
+| `PUT /results/{channel}/{label}` | store one (kept only if newer) |
+| `WS /ws/relay/{channel}?role=base\|rover\|watch` | base -> rovers (RTCM); rover -> watchers (live fix, JSON) |
 
 - **Waking up:** it sleeps after ~15 min idle and takes 30-60 s to wake; the
   page waits. While a session runs, the devices' status polls keep it awake.
@@ -107,9 +128,10 @@ push to `main`. GitHub Pages serves `web/` (`.github/workflows/pages.yml`).
 ## Android app
 
 `android/` drives Base and Rover over USB-OTG and shares the relay; a base
-in the app feeds a rover in a browser and vice versa. See
-`android/README.md`. The Site map runs in the browser; enter app results by
-hand.
+in the app feeds a rover in a browser and vice versa. Its **Site map** tab is
+the same page as the website, bundled into the app, and it opens and saves
+`cameras.local.yaml` through Android's file picker. See
+`android/README.md`.
 
 ## Testing
 
@@ -129,8 +151,9 @@ Checked against independent implementations, not against itself:
 | `tests/web/sitecalc.test.js` | Site map math against **geographiclib** and **PROJ**, and against Ground_EO_Tracker's `geolocation.py` / `site_layout.py` |
 | `tests/oracle/check_site_config.py` | a config written by the Site map, read with the tracker's own code: origin, `camera_origins()`, every other setting unchanged, boresight az/el |
 | `tests/web/site_browser.js` | the Site map in real headless Chrome: map, two tabs, Open -> Write -> Save |
-| `tests/server/test_relay.py` | relay fan-out, status, two bases, isolation, stalled rover (also against the live URL) |
-| `android/app/src/test/` | the app's protocol and session code against the same vectors and a real relay |
+| `tests/server/test_relay.py` | relay fan-out, status, two bases, isolation, stalled rover, results (newest wins, deletions, validation), live fixes to watchers (also against the live URL) |
+| `android/app/src/test/` | the app's protocol, session and result-sync code against the same vectors and a real relay |
+| `tests/android/site_in_app.js` | the installed app on a device/emulator: the Site map tab's WebView and bridge, results from the relay and from the app, live fix, and Open/Save through Android's file picker on a real file |
 
 The checks against Ground_EO_Tracker run when it's checked out next to this
 repo (or `GROUND_EO_TRACKER=<path>`); only its template `cameras.yaml` is
@@ -145,6 +168,7 @@ field test.
 | `web/site.html`, `site.js` | the Site map |
 | `web/gnss.js`, `webserial.js` | UBX/RTCM3 protocol; Web Serial connection + relay client |
 | `web/wgs84.js`, `sitecalc.js` | WGS84 <-> ENU; site geometry and `cameras.yaml` read/write |
+| `web/results.js` | survey results shared through the relay |
 | `server/app.py` | the relay (+ serves `web/`) |
 | `android/` | the native app |
 | `tests/` | see Testing |

@@ -25,6 +25,10 @@ class LocalRoverController(private val name: String, private val preemptible: Bo
 
     @Volatile private var stopRequested = false
 
+    /** Every live fix (for the in-app Site map); a finished point and its channel. */
+    @Volatile var onPvt: (Ubx.NavPvt?) -> Unit = {}
+    @Volatile var onResult: (PointResult, String) -> Unit = { _, _ -> }
+
     fun stop() { stopRequested = true }
 
     private fun launch(context: Context, portRef: UsbPortRef, body: (UsbGnssConnection) -> Unit) {
@@ -73,6 +77,7 @@ class LocalRoverController(private val name: String, private val preemptible: Bo
         RoverSession(conn, portRef.label, backendUrl, channel, { stopRequested }, { statusText = it }, { pvt ->
             fixBadge = fixBadgeText(pvt)
             fixed = pvt?.carrSoln == 2
+            onPvt(pvt)
         })
 
     fun startMonitor(context: Context, portRef: UsbPortRef, backendUrl: String, channel: String) =
@@ -85,5 +90,6 @@ class LocalRoverController(private val name: String, private val preemptible: Bo
         val r = session(conn, portRef, backendUrl, channel).point(label, durationS, requireFixed, origin)
         result = r
         statusText = if (r.cancelled) "cancelled" else "DONE \"${r.label}\": ${r.n} epochs averaged, fix=${r.allFixed}"
+        if (!r.cancelled) onResult(r, channel)
     }
 }

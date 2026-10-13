@@ -98,7 +98,9 @@ async function main() {
   }
   if (!pageBase.endsWith("/")) pageBase += "/";
   const shots = argVal("--shots");
-  console.log("page:", pageBase);
+  const relayBase = argVal("--relay") || (relay ? pageBase.replace(/\/$/, "") : "https://gnss-relay.onrender.com");
+  const SITE = "sb-" + Math.random().toString(36).slice(2, 8); // never the real "default" channel
+  console.log("page:", pageBase, " relay:", relayBase, " channel:", SITE);
 
   const cdpPort = await freePort();
   const profile = fs.mkdtempSync(path.join(os.tmpdir(), "site-chrome-"));
@@ -128,23 +130,32 @@ async function main() {
     const expect = C.analyzeSite(site);
     const expectedYaml = C.applyToConfig(y.template, expect, site.origin).text;
 
-    // tab 1: the console saves every point through its real function
+    // tab 1: the console saves every point through its real function (and uploads it)
     const consoleTab = await Tab.open(cdpPort, pageBase + "index.html");
     await consoleTab.waitFor("typeof saveSurveyResult === 'function' && document.readyState === 'complete'", 15000, "console loaded");
+    await consoleTab.eval(`document.getElementById('serverUrl').value = ${JSON.stringify(relayBase)}; document.getElementById('serverConnect').click();
+      document.getElementById('usbChannel').value = ${JSON.stringify(SITE)}; 1`);
     const results = [["origin", y.origin, 0.008], ["camera_a", y.poles.camera_a, 0.008], ["camera_b", y.poles.camera_b, 0.008],
       ...y.refs.map((r) => [r.name, r.geo, 0.01])];
     for (const [label, [lat, lon, h], spread] of results) {
       assert.equal(await consoleTab.eval(`saveSurveyResult(${JSON.stringify({ label, lat_deg: lat, lon_deg: lon, height_msl_m: h, n: 60, spread_m: spread, all_fixed: true })})`), true);
     }
     assert.equal(await consoleTab.eval("document.querySelector('.nav a[href=\"site.html\"]') !== null"), true);
-    log(`console tab saved ${results.map((r) => r[0]).join(", ")} via saveSurveyResult()`);
+    const onRelayCh = async (ch) => (await (await fetch(`${relayBase}/results/${ch}`)).json()).results;
+    const onRelay = () => onRelayCh(SITE);
+    const t0 = Date.now();
+    while (Object.keys(await onRelay()).length < results.length) {
+      if (Date.now() - t0 > 30000) throw new Error("results never reached the relay: " + JSON.stringify(await consoleTab.eval(`Results.sync(serverUrl, ${JSON.stringify(SITE)}).then((r) => ({ error: r.error, reachable: r.reachable, n: Object.keys(r.results).length, serverUrl }))`)));
+      await sleep(300);
+    }
+    log(`console tab saved ${results.map((r) => r[0]).join(", ")} via saveSurveyResult() and uploaded them to the relay`);
 
     // tab 2: the Site map - load, then type the mounts / sighted height like a user
     const site2 = await Tab.open(cdpPort, pageBase + "site.html");
     const tab = site2;
     await tab.waitFor("document.readyState === 'complete' && typeof SiteCalc === 'object'", 15000, "site loaded");
     assert.equal(await tab.eval("typeof L"), "object", "Leaflet loaded from cdnjs (SRI ok)");
-    await tab.eval("document.getElementById('loadSurvey').click(); 1");
+    await tab.waitFor(`document.getElementById('channel').value === ${JSON.stringify(SITE)} && document.getElementById('pairOut').innerText.includes('Distance')`, 20000, "results arrive by themselves");
     await tab.eval(`(() => {
       const set = (sel, v) => { const e = document.querySelector(sel); e.value = v; e.dispatchEvent(new Event('input')); };
       set('[data-point="camera_a"] input[data-key="mount"]', '${y.mounts.camera_a}');
@@ -175,7 +186,7 @@ async function main() {
     // plan -> corrections panel appears; exact plot draws everything
     await tab.eval(`(() => { const set = (id, v) => { const e = document.getElementById(id); e.value = v; e.dispatchEvent(new Event('input')); };
       set('planDist', '${(expect.pair.horizM + 0.25).toFixed(2)}'); set('planBearing', '${Math.round(expect.pair.enuBearingAB)}'); })()`);
-    assert.equal(await tab.eval("document.getElementById('planPanel').hidden"), false);
+    assert.equal(await tab.eval("getComputedStyle(document.getElementById('planPanel')).display"), "block");
     assert.match(await tab.eval("document.getElementById('planOut').innerText"), /Distance vs plan[\s\S]*move camera_a: [\s\S]*move camera_b: /);
     await tab.eval("document.getElementById('tabPlot').click(); 1");
     assert.equal(await tab.eval("document.querySelectorAll('#plot circle').length"), 3 + 2 + y.refs.length, "plot: origin, 2 poles, 2 planned, refs");
@@ -226,6 +237,48 @@ async function main() {
     await tab.waitFor("document.readyState === 'complete' && document.getElementById('pairOut').innerText.includes('Height difference')", 15000, "state after reload");
     log("page state survives a reload");
 
+    // ---- the same page as the Android app hosts it: window.AndroidSite bridge ----
+    const SITE2 = SITE + "-app";
+    for (const [label, [lat, lon, h]] of [["origin", y.origin], ["camera_a", y.poles.camera_a], ["camera_b", y.poles.camera_b]]) {
+      const r = await fetch(`${relayBase}/results/${SITE2}/${label}`, { method: "PUT", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ lat_deg: lat, lon_deg: lon, height_msl_m: h, n: 60, spread_m: 0.008, all_fixed: true, at: new Date().toISOString(), source: "web console" }) });
+      assert.ok(r.ok, "seed relay");
+    }
+    const appOnly = { lat_deg: y.refs[0].geo[0], lon_deg: y.refs[0].geo[1], height_msl_m: y.refs[0].geo[2], n: 30, spread_m: 0.009, all_fixed: true, at: new Date().toISOString(), source: "Android app" };
+    const appTab = await Tab.open(cdpPort, "about:blank");
+    await appTab.send("Page.addScriptToEvaluateOnNewDocument", { source: `
+      window.__calls = [];
+      window.AndroidSite = {
+        relayUrl: () => ${JSON.stringify(relayBase)}, channel: () => ${JSON.stringify(SITE2)},
+        results: (ch) => JSON.stringify(ch === ${JSON.stringify(SITE2)} ? { app_mast: ${JSON.stringify(appOnly)} } : {}),
+        openConfig: () => { __calls.push(["open"]); setTimeout(() => siteAndroid.configOpened("cameras.local.yaml", ${JSON.stringify(y.template)}), 10); },
+        saveConfig: (t) => { __calls.push(["save", t]); setTimeout(() => siteAndroid.configSaved(true, "saved cameras.local.yaml and read it back"), 10); },
+        saveConfigAs: (t) => __calls.push(["saveAs", t]),
+        copy: (t) => __calls.push(["copy", t]),
+      };` });
+    await appTab.send("Page.navigate", { url: pageBase + "site.html" });
+    await appTab.waitFor(`document.getElementById('channel').value === ${JSON.stringify(SITE2)} && document.getElementById('pairOut').innerText.includes('Distance')`, 20000, "app mode: relay results");
+    assert.equal(await appTab.eval("state.refs.map((r) => r.name).join()"), "app_mast", "the app's own (unsynced) result is shown");
+    const t1 = Date.now();
+    while (!(await onRelayCh(SITE2)).app_mast) { if (Date.now() - t1 > 20000) throw new Error("app-only result never uploaded"); await sleep(300); }
+    log("app mode: relay address + channel from the app, relay results shown, the app's own result shown AND uploaded");
+    await appTab.eval(`siteAndroid.pvt({ type: "pvt", lat: ${y.poles.camera_a[0]}, lon: ${y.poles.camera_a[1]}, h: ${y.poles.camera_a[2]}, carrSoln: 2, hAccM: 0.01, numSv: 20, source: "Android app" }); 1`);
+    await appTab.eval("const tt = document.getElementById('target'); tt.value = 'pole:camera_a'; tt.dispatchEvent(new Event('change')); 1");
+    assert.match(await appTab.eval("document.getElementById('liveOut').innerText"), /rover \(Android app\)[\s\S]*camera_a \(surveyed\): in place/);
+    await appTab.eval("document.getElementById('cfgOpen').click(); 1");
+    await appTab.waitFor("!document.getElementById('cfgWrite').disabled", 5000, "app mode: file opened through the bridge");
+    await appTab.eval("document.getElementById('cfgWrite').click(); 1");
+    assert.equal(await appTab.eval("document.querySelectorAll('#cfgChanges tr.changed').length"), 10);
+    assert.notEqual(await appTab.eval("getComputedStyle(document.getElementById('cfgSave')).display"), "none", "app mode: Save to the file offered");
+    assert.equal(await appTab.eval("getComputedStyle(document.querySelector('.nav')).display"), "none", "app mode: the website's nav is not shown");
+    await appTab.eval("document.getElementById('cfgSave').click(); 1");
+    await appTab.waitFor("/saved cameras.local.yaml and read it back/.test(document.getElementById('cfgMsg').innerText)", 5000, "app mode: saved");
+    const saved = await appTab.eval("__calls.find((c) => c[0] === 'save')[1]");
+    const appSite = { origin: { lat: y.origin[0], lon: y.origin[1], h: y.origin[2] }, poles: {}, refs: [], plan: null, declinationDeg: null };
+    for (const id of ["camera_a", "camera_b"]) appSite.poles[id] = { lat: y.poles[id][0], lon: y.poles[id][1], h: y.poles[id][2], mount: 0 };
+    assert.equal(saved, C.applyToConfig(y.template, C.analyzeSite(appSite), appSite.origin).text, "app mode: the text handed to the app to save");
+    log("app mode: Open file... / Save to the file go through the app bridge; live fix pushed in by the app shows");
+
     if (shots) {
       fs.mkdirSync(shots, { recursive: true });
       // a typical site for the pictures: origin at the midpoint, poles ~50 m apart near 90 deg, two far references
@@ -245,7 +298,7 @@ async function main() {
       log(`screenshots in ${shots} (desktop ${d.height}px, phone ${m.height}px, no sideways scroll; console ${c.height}px)`);
     }
 
-    const errs = [...consoleTab.errors, ...tab.errors];
+    const errs = [...consoleTab.errors, ...tab.errors, ...appTab.errors];
     assert.deepEqual(errs, [], "page errors");
     console.log("\nALL SITE MAP BROWSER CHECKS PASSED");
   } finally {

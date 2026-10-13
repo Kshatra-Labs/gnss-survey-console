@@ -423,7 +423,32 @@ function startRelayDownload(backendUrl, channel, conn, onStatus) {
   });
   link.rtcmIn = rtcmIn;
   link.statsLine = () => linkStatsLine(link, "received");
+  // the rover's live fix, at most once a second, for the Site map on any device
+  let lastPvtSent = 0;
+  link.sendPvt = (pvt, source) => {
+    const ws = link.ws();
+    if (!pvt || pvt.fixType < 2 || !ws || ws.readyState !== WebSocket.OPEN || Date.now() - lastPvtSent < 1000) return;
+    lastPvtSent = Date.now();
+    ws.send(JSON.stringify({ type: "pvt", lat: pvt.latDeg, lon: pvt.lonDeg, h: pvt.heightMslM, carrSoln: pvt.carrSoln,
+      hAccM: pvt.hAccM, numSv: pvt.numSv, source: source || "web console" }));
+  };
   return link;
+}
+
+/** Site map: follows a channel - rovers' live fixes and new results, as
+ * parsed JSON events - reconnecting every 3 s. */
+function startRelayWatch(backendUrl, channel, onEvent, onState) {
+  let stopped = false, ws = null, timer = null;
+  function connect() {
+    if (stopped) return;
+    try { ws = new WebSocket(relayWsUrl(backendUrl, channel, "watch")); } catch (e) { onState && onState(false, e.message); return; }
+    ws.onopen = () => onState && onState(true);
+    ws.onmessage = (ev) => { if (typeof ev.data === "string") { try { onEvent(JSON.parse(ev.data)); } catch (e) { /* not ours */ } } };
+    ws.onclose = () => { onState && onState(false); if (!stopped) timer = setTimeout(connect, 3000); };
+    ws.onerror = () => { /* onclose follows */ };
+  }
+  connect();
+  return { stop() { stopped = true; clearTimeout(timer); try { if (ws) ws.close(); } catch (e) { /* ignore */ } } };
 }
 
 if (typeof window !== "undefined") {
@@ -433,4 +458,5 @@ if (typeof window !== "undefined") {
   window.startChannelStatus = startChannelStatus;
   window.channelStatusLine = channelStatusLine;
   window.normalizeRelayUrl = normalizeRelayUrl;
+  window.startRelayWatch = startRelayWatch;
 }

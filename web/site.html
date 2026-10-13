@@ -12,6 +12,7 @@
     --muted: #8b98a5; --accent: #4fa3ff; --good: #35c46b; --warn: #e0a63c; --bad: #e0503c;
   }
   * { box-sizing: border-box; }
+  [hidden] { display: none !important; }
   body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; padding: 16px; max-width: 1200px; margin-inline: auto; }
   h1 { font-size: 18px; margin: 0 0 4px; }
   .nav { display: flex; gap: 6px; margin-bottom: 14px; flex-wrap: wrap; }
@@ -90,12 +91,14 @@
   <div class="col">
     <div class="panel">
       <h2>1. Points</h2>
-      <div class="hint">Survey <b>origin</b>, <b>camera_a</b>, <b>camera_b</b> on the Survey console (plus any reference points for north alignment, under any other name), then load them here.</div>
+      <div class="hint">Points surveyed on this channel - in the web console or the Android app, on any device - arrive here by themselves: <b>origin</b>, <b>camera_a</b>, <b>camera_b</b>, and any other name as a reference point for north alignment.</div>
+      <label for="channel">Site channel (the relay channel used for the survey)</label>
+      <input id="channel" autocomplete="off" spellcheck="false">
+      <div id="syncNote" class="src"></div>
       <div class="btns">
         <button id="loadSurvey">Load survey results</button>
         <button id="clearPoints" class="secondary">Clear</button>
       </div>
-      <div id="surveyNote" class="src"></div>
       <div id="pointForms"></div>
       <h4>Reference points (for aiming / north alignment)</h4>
       <div id="refForms"></div>
@@ -185,7 +188,7 @@
 
     <div class="panel">
       <h2><span class="dot" style="background:var(--accent)"></span> Live rover - walk to a spot</h2>
-      <div class="hint">Run the rover's Live monitor on the Survey console in another tab of this browser; its position shows here with directions to the target.</div>
+      <div class="hint">Any rover surveying on this channel - web console or Android app, on any device - shows here live, with directions to the target.</div>
       <label for="target">Target</label>
       <select id="target"></select>
       <div id="liveOut" class="live">waiting for the console's rover...</div>
@@ -196,6 +199,8 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"
         integrity="sha512-puJW3E/qXDqYp9IfhAI54BJEaWIfloJ7JWs7OeD5i6ruC9JZL1gERT1wjtwXFlh7CjE7ZJ+/vcRZRkIYIb6p4g==" crossorigin="anonymous"></script>
 <script src="wgs84.js"></script>
+<script src="webserial.js"></script>
+<script src="results.js"></script>
 <script src="sitecalc.js"></script>
 <script src="site.js"></script>
 </body>

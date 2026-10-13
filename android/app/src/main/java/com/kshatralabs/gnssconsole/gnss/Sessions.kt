@@ -44,7 +44,11 @@ fun fixBadgeText(pvt: Ubx.NavPvt?): String = when {
 private fun failed(cfg: Map<String, Boolean>): String? =
     cfg.filterValues { !it }.keys.takeIf { it.isNotEmpty() }?.let { "setup warning: receiver did not acknowledge ${it.joinToString(", ")}" }
 
-/** Rover: live monitor (mode "monitor") or averaged point survey ("point"). */
+/** How this app's rover names itself to the Site map. */
+const val LIVE_SOURCE = "Android app"
+
+/** Rover: live monitor (mode "monitor") or averaged point survey ("point").
+ * Both send the live fix up the relay link for the Site map. */
 class RoverSession(
     private val conn: UsbGnssConnection,
     private val deviceLabel: String,
@@ -80,6 +84,7 @@ class RoverSession(
                 if (!conn.alive) throw SessionException("USB receiver disconnected")
                 onStatus(block(link, pvt, "LIVE MONITOR (nothing recorded)", warn))
                 onFix(pvt)
+                link.sendPvt(pvt, LIVE_SOURCE)
             }
             onStatus(block(link, conn.latestPvt(), "monitor stopped", warn))
         } finally {
@@ -107,6 +112,7 @@ class RoverSession(
                     if (requireFixed) " (RTK FIXED only)" else " (RTK FIXED or FLOAT)"
                 onStatus(block(link, pvt, head, warn))
                 onFix(pvt)
+                link.sendPvt(pvt, LIVE_SOURCE)
                 if (pvt == null) continue
                 framesSeen++
                 if (pvt.carrSoln > bestCarr) bestCarr = pvt.carrSoln

@@ -1,6 +1,8 @@
 package com.kshatralabs.gnssconsole
 
+import android.app.Application
 import android.content.BroadcastReceiver
+import android.content.SharedPreferences
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
@@ -28,12 +30,15 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
-import androidx.lifecycle.ViewModel
+import androidx.compose.ui.viewinterop.AndroidView
+import androidx.lifecycle.AndroidViewModel
+import com.kshatralabs.gnssconsole.gnss.LIVE_SOURCE
 import com.kshatralabs.gnssconsole.gnss.LocalBaseController
 import com.kshatralabs.gnssconsole.gnss.LocalRoverController
 import com.kshatralabs.gnssconsole.gnss.Origin
 import com.kshatralabs.gnssconsole.gnss.PointResult
 import com.kshatralabs.gnssconsole.gnss.RelayClient
+import com.kshatralabs.gnssconsole.gnss.Results
 import com.kshatralabs.gnssconsole.gnss.UsbPortRef
 import com.kshatralabs.gnssconsole.gnss.UsbRover
 import com.kshatralabs.gnssconsole.gnss.fmt
@@ -42,31 +47,90 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 
 private const val PREFS = "gnss_console_prefs"
+private const val RESULTS_PREFS = "gnss_results"
 private const val KEY_BACKEND_URL = "backend_url"
+private const val KEY_CHANNEL = "channel"
+private const val SYNC_EVERY_MS = 60_000L
 
 // Same default relay as web/app.js. It only forwards RTCM3 bytes; all GNSS
 // work happens on whichever device has the receiver plugged in.
 private const val DEFAULT_BACKEND = "https://gnss-relay.onrender.com"
 private const val DEFAULT_CHANNEL = "default"
 
-/** Survives rotation, so a running session is never orphaned. */
-class ConsoleViewModel : ViewModel() {
+private class PrefsKv(private val p: SharedPreferences) : Results.KeyValue {
+    override fun get(key: String): String? = p.getString(key, null)
+    override fun put(key: String, value: String) { p.edit().putString(key, value).apply() }
+    override fun keys(): Set<String> = p.all.keys
+}
+
+/** Survives rotation, so a running session is never orphaned. Owns this
+ * phone's survey results and keeps them synced with the relay, where the
+ * Site map on any device (this app's included) picks them up. */
+class ConsoleViewModel(app: Application) : AndroidViewModel(app) {
+    private val prefs = app.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+    val results = Results(PrefsKv(app.getSharedPreferences(RESULTS_PREFS, Context.MODE_PRIVATE)))
     val base = LocalBaseController()
     val point = LocalRoverController("Rover point survey", preemptible = false)
     val monitor = LocalRoverController("Rover live monitor", preemptible = true)
-    var channel by mutableStateOf(DEFAULT_CHANNEL)
+    var backendUrl by mutableStateOf(prefs.getString(KEY_BACKEND_URL, null) ?: DEFAULT_BACKEND)
+        private set
+    var channel by mutableStateOf(prefs.getString(KEY_CHANNEL, null) ?: DEFAULT_CHANNEL)
+        private set
     var originLat by mutableStateOf("")
     var originLon by mutableStateOf("")
     var originAlt by mutableStateOf("")
     var usbTick by mutableIntStateOf(0)
+    var tab by mutableIntStateOf(0)
+    /** Upload state of the latest point result, shown under it. */
+    var syncText by mutableStateOf<String?>(null)
+    var syncOk by mutableStateOf<Boolean?>(null)
+    /** Set by the Activity: runs JavaScript in the Site map page. */
+    @Volatile var siteJs: (String) -> Unit = {}
+    @Volatile private var cleared = false
+    @Volatile private var lastPvtToSite = 0L
+
+    init {
+        point.onResult = { r, ch -> results.record(ch, r); syncText = "uploading to the relay..."; syncOk = null; syncNow(ch) }
+        point.onPvt = ::pvtToSite
+        monitor.onPvt = ::pvtToSite
+        // anything surveyed while the relay was unreachable goes up as soon as it answers
+        Thread {
+            while (!cleared) {
+                try { Thread.sleep(SYNC_EVERY_MS) } catch (_: InterruptedException) { }
+                for (ch in results.channels()) if (!cleared) syncNow(ch, quiet = true)
+            }
+        }.apply { isDaemon = true; start() }
+    }
+
+    fun updateBackendUrl(url: String) { backendUrl = url; prefs.edit().putString(KEY_BACKEND_URL, url).apply() }
+    fun updateChannel(ch: String) { channel = ch; prefs.edit().putString(KEY_CHANNEL, ch).apply() }
+
+    fun syncNow(channel: String, quiet: Boolean = false) = Thread {
+        val o = results.sync(backendUrl, channel)
+        if (!quiet || o.pushed > 0) {
+            syncOk = o.error == null
+            syncText = if (o.error == null) "on the relay: the Site map on any device sees it (channel \"$channel\")"
+            else "not on the relay yet (${o.error}) - kept on this phone, retried every minute"
+        }
+        siteJs("siteAndroid.resultsChanged()")
+    }.apply { isDaemon = true; start() }
+
+    private fun pvtToSite(pvt: com.kshatralabs.gnssconsole.gnss.Ubx.NavPvt?) {
+        val now = System.currentTimeMillis()
+        if (pvt == null || pvt.fixType < 2 || now - lastPvtToSite < 1000) return
+        lastPvtToSite = now
+        siteJs("siteAndroid.pvt(${RelayClient.pvtJson(pvt, LIVE_SOURCE)})")
+    }
 
     override fun onCleared() {
+        cleared = true
         base.stop(); point.stop(); monitor.stop()
     }
 }
 
 class MainActivity : ComponentActivity() {
     private val vm: ConsoleViewModel by viewModels()
+    private lateinit var site: SiteMapHost
 
     private val usbReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) { vm.usbTick++ }
@@ -79,9 +143,11 @@ class MainActivity : ComponentActivity() {
             addAction(UsbManager.ACTION_USB_DEVICE_DETACHED)
         }
         ContextCompat.registerReceiver(this, usbReceiver, filter, ContextCompat.RECEIVER_NOT_EXPORTED)
+        site = SiteMapHost(this, vm)
+        vm.siteJs = site::js
         setContent {
             MaterialTheme {
-                Surface(modifier = Modifier.fillMaxSize()) { GnssConsoleApp(vm) }
+                Surface(modifier = Modifier.fillMaxSize()) { GnssConsoleApp(vm, site) }
             }
         }
     }
@@ -92,16 +158,10 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
+        vm.siteJs = {} // the WebView goes with this Activity; the ViewModel may outlive it
         unregisterReceiver(usbReceiver)
         super.onDestroy()
     }
-}
-
-private fun loadBackendUrl(ctx: Context): String =
-    ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString(KEY_BACKEND_URL, null) ?: DEFAULT_BACKEND
-
-private fun saveBackendUrl(ctx: Context, url: String) {
-    ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putString(KEY_BACKEND_URL, url).apply()
 }
 
 private val Good = Color(0xFF2E9E55)
@@ -109,9 +169,24 @@ private val Warn = Color(0xFFC98A1B)
 private val Bad = Color(0xFFD0453A)
 
 @Composable
-fun GnssConsoleApp(vm: ConsoleViewModel) {
+fun GnssConsoleApp(vm: ConsoleViewModel, site: SiteMapHost) {
+    Column(Modifier.fillMaxSize()) {
+        TabRow(selectedTabIndex = vm.tab) {
+            Tab(selected = vm.tab == 0, onClick = { vm.tab = 0 }, text = { Text("Survey") })
+            Tab(selected = vm.tab == 1, onClick = { vm.tab = 1 }, text = { Text("Site map") })
+        }
+        if (vm.tab == 0) SurveyScreen(vm) else AndroidView(factory = { site.webView() }, modifier = Modifier.fillMaxSize())
+    }
+    // the Site map follows the channel set on the Survey tab
+    LaunchedEffect(vm.tab, vm.channel) {
+        if (vm.tab == 1 && vm.channel.isNotBlank()) site.js("siteAndroid.useChannel(${SiteMapHost.q(vm.channel)})")
+    }
+}
+
+@Composable
+private fun SurveyScreen(vm: ConsoleViewModel) {
     val ctx = LocalContext.current
-    var backendUrl by remember { mutableStateOf(loadBackendUrl(ctx)) }
+    val backendUrl = vm.backendUrl
 
     var usbPorts by remember { mutableStateOf(listOf<UsbPortRef>()) }
     var usbRawCount by remember { mutableIntStateOf(0) }
@@ -143,7 +218,7 @@ fun GnssConsoleApp(vm: ConsoleViewModel) {
         )
         Spacer(Modifier.height(12.dp))
 
-        RelayCard(backendUrl = backendUrl, onBackendUrlChange = { backendUrl = it; saveBackendUrl(ctx, it) })
+        RelayCard(backendUrl = backendUrl, onBackendUrlChange = { vm.updateBackendUrl(it) })
         Spacer(Modifier.height(16.dp))
 
         UsbPortsCard(ports = usbPorts, rawCount = usbRawCount, onRescan = { refreshUsbPorts() })
@@ -291,8 +366,8 @@ private fun NumberField(label: String, value: String, enabled: Boolean, modifier
 @Composable
 private fun ChannelField(vm: ConsoleViewModel, enabled: Boolean) {
     OutlinedTextField(
-        value = vm.channel, onValueChange = { vm.channel = it.trim() }, enabled = enabled,
-        label = { Text("Relay channel (same on Base and Rover)") },
+        value = vm.channel, onValueChange = { vm.updateChannel(it.trim()) }, enabled = enabled,
+        label = { Text("Relay channel (same on Base, Rover and Site map)") },
         singleLine = true, modifier = Modifier.fillMaxWidth().padding(top = 6.dp),
     )
 }
@@ -377,10 +452,18 @@ private fun PointCard(vm: ConsoleViewModel, c: LocalRoverController, ports: List
             NumberField("Duration (s)", duration, !c.running, Modifier.fillMaxWidth().padding(top = 6.dp)) { duration = it }
             ChannelField(vm, !c.running)
             OutlinedTextField(
-                value = label, onValueChange = { label = it }, enabled = !c.running,
-                label = { Text("Label (origin, camera_a, ...)") },
+                value = label, onValueChange = { label = it.trim() }, enabled = !c.running,
+                label = { Text("Label (origin, camera_a, camera_b, or a reference point name)") },
                 singleLine = true, modifier = Modifier.fillMaxWidth().padding(top = 6.dp),
             )
+            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                for (l in listOf("origin", "camera_a", "camera_b")) {
+                    FilterChip(selected = label == l, onClick = { label = l }, enabled = !c.running, label = { Text(l) })
+                }
+            }
+            val labelErr = if (label.isNotEmpty() && !Results.LABEL_RE.matches(label)) "label: letters, digits, _ . - only" else null
+            if (labelErr != null) Text(labelErr, color = Bad, fontSize = 12.sp)
+            Text("Any other name is a reference point for aiming the cameras (Site map).", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
             Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(top = 6.dp)) {
                 Checkbox(checked = requireFixed, onCheckedChange = { requireFixed = it }, enabled = !c.running)
                 Text("RTK FIXED epochs only (untick to also accept FLOAT)", fontSize = 12.sp)
@@ -394,7 +477,7 @@ private fun PointCard(vm: ConsoleViewModel, c: LocalRoverController, ports: List
             if (originErr != null) Text(originErr, color = Bad, fontSize = 12.sp)
             Row(Modifier.padding(top = 8.dp)) {
                 Button(
-                    enabled = !c.running && port != null && label.isNotBlank() && d != null && d > 0 && originErr == null && vm.channel.isNotBlank(),
+                    enabled = !c.running && port != null && label.isNotBlank() && labelErr == null && d != null && d > 0 && originErr == null && vm.channel.isNotBlank(),
                     onClick = {
                         val p = port ?: return@Button
                         val o = if (label.trim() == "origin") null else origin.getOrNull()
@@ -405,7 +488,16 @@ private fun PointCard(vm: ConsoleViewModel, c: LocalRoverController, ports: List
                 OutlinedButton(enabled = c.running, onClick = { c.stop() }) { Text("Stop") }
             }
             StatusBox(c.error?.let { "ERROR: $it" } ?: c.statusText, c.error != null)
-            c.result?.let { PointResultView(it) }
+            c.result?.let { r ->
+                PointResultView(r)
+                if (!r.cancelled) vm.syncText?.let { t ->
+                    Text(
+                        "saved as \"${r.label}\" for the Site map - $t", fontSize = 12.sp,
+                        color = when (vm.syncOk) { true -> Good; false -> Warn; null -> MaterialTheme.colorScheme.onSurfaceVariant },
+                        modifier = Modifier.padding(top = 4.dp),
+                    )
+                }
+            }
         }
     }
 }
