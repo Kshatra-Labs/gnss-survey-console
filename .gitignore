@@ -14,3 +14,4 @@ tests/oracle/js_frames.json
 tests/oracle/kt_frames.json
 # generated at test time; holds Ground_EO_Tracker's (private) config template
 tests/oracle/site_vectors.json
+tests/oracle/js_site.json

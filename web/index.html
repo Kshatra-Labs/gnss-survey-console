@@ -13,16 +13,12 @@
   body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; padding: 16px; max-width: 900px; margin-inline: auto; }
   h1 { font-size: 18px; margin: 0 0 4px; }
   .sub { color: var(--muted); margin-bottom: 16px; font-size: 13px; }
-  .intro { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; margin-bottom: 16px; font-size: 13.5px; }
-  .intro b { color: var(--accent); }
-  .intro .roles { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 10px; }
-  .intro .role { background: #0b0f13; border-radius: 8px; padding: 10px 12px; }
-  .intro .role .tag { font-weight: 700; font-size: 12px; letter-spacing: .04em; text-transform: uppercase; }
-  .intro .role.base .tag { color: var(--good); }
-  .intro .role.rover .tag { color: var(--accent); }
-  .intro .fineprint { color: var(--muted); font-size: 11.5px; margin-top: 10px; }
-  @media (max-width: 560px) { .intro .roles { grid-template-columns: 1fr; } }
-
+  .steps { margin: 0 0 14px; padding: 12px 16px 12px 34px; background: var(--panel); border: 1px solid var(--border); border-radius: 10px; font-size: 13.5px; }
+  .steps li { margin: 3px 0; }
+  .steps a { color: var(--accent); }
+  details.relay summary { cursor: pointer; list-style-position: inside; }
+  .status.inline { display: inline; margin: 0; padding: 0; background: none; min-height: 0; color: var(--muted); }
+  .status.inline.err { color: var(--bad); }
   .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 16px; }
   .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; position: relative; }
   .panel.base { border-color: #235232; }
@@ -64,50 +60,29 @@
   <a href="site.html">Site map</a>
 </div>
 <h1>GNSS Survey Console</h1>
-<div class="sub">Base and Rover both plug into USB ports on real devices and run entirely in the browser.</div>
+<div class="sub">Two u-blox F9P receivers as an RTK pair: centimetre positions, straight from USB in this browser (Chrome or Edge).</div>
 
-<div class="intro">
-  A single GPS is accurate to a few metres. Two GPS units working together
-  as <b>RTK</b> - one fixed, one carried around - are accurate to a couple of
-  <b>centimetres</b>. That's what this page runs:
-  <div class="roles">
-    <div class="role base">
-      <div class="tag">Base</div>
-      Plug this receiver into a USB port on whatever device is staying put,
-      connect it below, and leave it running. It works out its own position
-      precisely, then uploads corrections to the cloud relay.
-    </div>
-    <div class="role rover">
-      <div class="tag">Rover</div>
-      Plug this one into a USB port on whatever device you're carrying
-      around, connect it, and pull corrections from the same relay channel
-      to get a centimetre-accurate reading of wherever it currently is.
-    </div>
-  </div>
-  <div class="fineprint">
-    The relay only forwards bytes - it has no USB/GPS access of its own, so
-    all the actual GNSS work happens on whichever device has a receiver
-    plugged in, here or in the Android app. Requires Chrome or Edge (Web
-    Serial API) - not Firefox or Safari.
-  </div>
-</div>
+<ol class="steps">
+  <li><b>Base</b> - receiver that stays put: Connect, <b>Start base</b>, wait for <i>broadcasting</i>.</li>
+  <li><b>Rover</b> - receiver you carry: Connect, <b>Live monitor</b> until it shows <i>FIX=true</i>.</li>
+  <li>Survey <b>origin</b>, then <b>camera_a</b> and <b>camera_b</b> (and any reference points), then open the <a href="site.html">Site map</a> to check them and write <code>cameras.local.yaml</code>.</li>
+</ol>
 
-<div class="panel" style="margin-bottom:16px;">
-  <h2>Cloud relay</h2>
-  <div class="step-hint">Where Base and Rover find each other. Auto-filled with this project's known address - only change it if you're running your own relay.</div>
+<details class="panel relay" style="margin-bottom:16px;">
+  <summary><span id="relayHealth" class="status inline">checking relay...</span></summary>
+  <div class="step-hint" style="margin-top:10px">The cloud relay forwards corrections from Base to Rover (it has no GPS access of its own). Only change it if you run your own relay.</div>
   <div class="row">
-    <input id="serverUrl" placeholder="https://your-relay-address">
+    <input id="serverUrl" placeholder="https://your-relay-address" aria-label="relay address">
     <button id="serverConnect" style="flex:0 0 auto;margin-top:0">Save &amp; test</button>
   </div>
-  <div id="relayHealth" class="status">checking relay...</div>
-</div>
+</details>
 
 <div class="grid">
 
   <div id="baseUsbPanel" class="panel base">
     <span id="baseUsbBadge" class="badge">idle</span>
     <h2>1. Base (USB)</h2>
-    <div class="step-hint">Plug the base receiver in, connect it (baud rate is detected automatically), then leave it running for the whole survey.</div>
+    <div class="step-hint">The receiver that stays put for the whole survey. Needs open sky.</div>
     <div id="baseUsbUnsupported" class="unsupported" style="display:none;">
       This browser doesn't support direct USB access (Web Serial). Use Chrome or Edge.
     </div>
@@ -125,7 +100,7 @@
       </details>
       <label>Relay channel (must match the rover's)</label>
       <input id="baseUsbChannel" value="default">
-      <small class="hint">Needs open sky. Status moves surveying -> broadcasting; corrections only exist once it says "broadcasting". Keep this tab open and the device awake.</small>
+      <small class="hint">It surveys its own position first, then says "broadcasting". Keep this tab open.</small>
       <button id="baseUsbStart">Start base</button>
       <button id="baseUsbStop" class="stop" disabled>Stop</button>
     </div>
@@ -134,8 +109,8 @@
 
   <div class="panel point">
     <span id="usbBadge" class="badge">idle</span>
-    <h2>2. Rover - survey a point (USB)</h2>
-    <div class="step-hint">Plug the receiver in, connect it below (baud rate is detected automatically), then carry it to each spot you're recording. Survey "origin" first. Wait for FIX=true in the live status before trusting a point.</div>
+    <h2>2. Rover (USB)</h2>
+    <div class="step-hint">The receiver you carry to each spot. Survey "origin" first; only trust a point once it shows FIX=true.</div>
 
     <div id="usbUnsupported" class="unsupported" style="display:none;">
       This browser doesn't support direct USB access (Web Serial). Use Chrome or Edge.
@@ -149,7 +124,7 @@
     <div id="usbControls" style="display:none;">
       <div class="row">
         <div><label>Duration (s)</label><input id="usbDuration" value="60"></div>
-        <div><label>Label</label><input id="usbLabel" placeholder="origin, camera_a, ..."></div>
+        <div><label>Label</label><input id="usbLabel" list="labelList" placeholder="origin, camera_a, camera_b, ..."></div>
       </div>
       <label>Relay channel (must match Base's)</label>
       <input id="usbChannel" value="default">
@@ -157,7 +132,8 @@
         <input type="checkbox" id="usbRequireFixed" checked>
         <label style="margin:0">RTK FIXED epochs only (uncheck to allow FLOAT - less accurate)</label>
       </div>
-      <small class="hint">Survey "origin" first - its result auto-fills the fields below, so every point after gets its east/north/up offset computed automatically.</small>
+      <datalist id="labelList"><option value="origin"><option value="camera_a"><option value="camera_b"></datalist>
+      <small class="hint">Any other label (e.g. "mast") is a reference point for aiming the cameras. The origin result fills the fields below; later points get their east/north/up offset from it.</small>
       <div class="row">
         <div><label>Origin lat</label><input id="originLat" placeholder="auto-filled"></div>
         <div><label>Origin lon</label><input id="originLon" placeholder="auto-filled"></div>

@@ -10,7 +10,6 @@
   :root {
     --bg: #0e1216; --panel: #161c22; --border: #26303a; --text: #e6edf3; --well: #0b0f13;
     --muted: #8b98a5; --accent: #4fa3ff; --good: #35c46b; --warn: #e0a63c; --bad: #e0503c;
-    --origin: #e6edf3; --pa: #35c46b; --pb: #f08a3c; --live: #4fa3ff;
   }
   * { box-sizing: border-box; }
   body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; padding: 16px; max-width: 1200px; margin-inline: auto; }
@@ -23,46 +22,57 @@
   @media (max-width: 860px) { .layout { grid-template-columns: 1fr; } .col.results { order: -1; } }
   .col { display: grid; gap: 16px; min-width: 0; }
   .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; min-width: 0; }
-  .panel h2 { font-size: 14px; margin: 0 0 2px; display: flex; align-items: center; gap: 8px; }
+  .panel h2 { font-size: 14px; margin: 0 0 2px; }
   .hint { color: var(--muted); font-size: 12px; margin: 2px 0 8px; }
   .dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; flex: none; }
   label { display: block; font-size: 11.5px; color: var(--muted); margin: 8px 0 3px; }
   input, select, textarea { width: 100%; background: var(--well); border: 1px solid var(--border); color: var(--text); padding: 6px 8px; border-radius: 6px; font-size: 13.5px; font-family: inherit; }
-  textarea { font-family: ui-monospace, monospace; font-size: 12px; min-height: 120px; resize: vertical; }
+  textarea { font-family: ui-monospace, monospace; font-size: 12px; min-height: 110px; resize: vertical; }
   .row { display: flex; gap: 8px; }
   .row > * { flex: 1; min-width: 0; }
   .pt { border-top: 1px solid var(--border); padding-top: 10px; margin-top: 10px; }
-  .pt:first-of-type { border-top: none; margin-top: 4px; padding-top: 0; }
   .pt h3 { font-size: 13px; margin: 0; display: flex; align-items: center; gap: 8px; }
+  .pt h3 input { width: auto; flex: 1; padding: 3px 6px; font-size: 13px; font-weight: 600; }
+  .pt h3 button { margin: 0; padding: 3px 8px; font-size: 12px; }
+  h4 { font-size: 12.5px; margin: 16px 0 0; color: var(--muted); font-weight: 600; }
   .src { font-size: 11.5px; color: var(--muted); margin-top: 4px; }
   .src.bad { color: var(--warn); }
   button { background: var(--accent); color: #06131f; border: none; padding: 7px 12px; border-radius: 6px; font-weight: 600; cursor: pointer; font-size: 13px; margin-top: 10px; }
   button.secondary { background: #223041; color: var(--text); }
+  button:disabled { opacity: 0.4; cursor: default; }
   .btns { display: flex; gap: 8px; flex-wrap: wrap; }
-  #map { height: 440px; border-radius: 8px; background: var(--well); }
-  .maptools { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 8px; font-size: 12px; color: var(--muted); }
-  .maptools button { margin: 0; padding: 4px 10px; font-size: 12px; }
-  .maptools select { width: auto; padding: 3px 6px; font-size: 12px; }
-  #plot { width: 100%; height: 360px; display: block; background: var(--well); border-radius: 8px; touch-action: none; }
+  .tabs { display: flex; gap: 6px; margin: 6px 0 10px; }
+  .tabs button { margin: 0; padding: 5px 12px; font-size: 12.5px; background: #223041; color: var(--muted); }
+  .tabs button.on { background: #12263a; color: var(--text); outline: 1px solid var(--accent); }
+  #map { height: 420px; border-radius: 8px; background: var(--well); }
+  #plot { width: 100%; height: 360px; display: block; background: var(--well); border-radius: 8px; }
+  .viewtools { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 8px; font-size: 12px; color: var(--muted); }
+  .viewtools button { margin: 0; padding: 4px 10px; font-size: 12px; }
+  .viewtools select { width: auto; padding: 3px 6px; font-size: 12px; }
   .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin-top: 8px; }
   .kpi { background: var(--well); border-radius: 8px; padding: 10px 12px; }
   .kpi .k { font-size: 11.5px; color: var(--muted); }
   .kpi .v { font-size: 20px; font-weight: 650; font-variant-numeric: tabular-nums; margin-top: 2px; }
   .kpi .s { font-size: 11.5px; color: var(--muted); margin-top: 2px; font-variant-numeric: tabular-nums; }
   table { width: 100%; border-collapse: collapse; font-size: 12.5px; font-variant-numeric: tabular-nums; margin-top: 8px; }
-  th, td { text-align: left; padding: 5px 6px; border-bottom: 1px solid var(--border); }
+  th, td { text-align: left; padding: 5px 6px; border-bottom: 1px solid var(--border); vertical-align: top; }
   th { color: var(--muted); font-weight: 500; }
-  td.num { text-align: right; font-family: ui-monospace, monospace; }
+  td.num { text-align: right; font-family: ui-monospace, monospace; white-space: nowrap; }
+  td code { font-size: 11.5px; word-break: break-all; }
+  td button { margin: 0; padding: 2px 8px; font-size: 11.5px; }
+  tr.changed td { color: var(--good); }
   .tablewrap { overflow-x: auto; }
   .warn { color: var(--warn); font-size: 12.5px; margin-top: 8px; }
   .move { background: var(--well); border-radius: 8px; padding: 10px 12px; margin-top: 8px; font-size: 13px; }
-  .move b { font-variant-numeric: tabular-nums; }
   .live { font-family: ui-monospace, monospace; font-size: 12.5px; background: var(--well); border-radius: 6px; padding: 10px; white-space: pre-wrap; margin-top: 8px; }
-  .live .big { font-size: 18px; font-weight: 700; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+  .live .big { font-size: 18px; font-weight: 700; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 4px 0; }
   .fix-true { color: var(--good); } .fix-false { color: var(--warn); } .stale { color: var(--bad); }
   pre.snippet { background: var(--well); border-radius: 6px; padding: 10px; font-size: 12px; overflow-x: auto; margin: 8px 0 0; }
   .note { font-size: 11.5px; color: var(--muted); margin-top: 6px; }
-  .empty { color: var(--muted); font-size: 13px; padding: 8px 0; }
+  .empty { color: var(--muted); font-size: 13px; padding: 6px 0; }
+  .msg { font-size: 12.5px; margin-top: 8px; }
+  .msg.bad { color: var(--warn); } .msg.good { color: var(--good); }
+  details summary { cursor: pointer; color: var(--muted); font-size: 12.5px; }
   .leaflet-container { font: 12px/1.3 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
   .leaflet-tooltip.lbl { background: rgba(11, 15, 19, .85); color: #e6edf3; border: 1px solid #26303a; box-shadow: none; }
   .leaflet-tooltip.lbl::before { display: none; }
@@ -73,53 +83,62 @@
   <a href="index.html">Survey console</a>
   <a href="site.html" class="on">Site map</a>
 </div>
-<h1>Site map - poles, distance and bearing</h1>
-<div class="sub">Uses the points surveyed on the Survey console (same browser), or values you type or read from <code>cameras.local.yaml</code>. Everything is computed here in the page; nothing is uploaded.</div>
+<h1>Site map</h1>
+<div class="sub">Pole distance and bearing, where to aim the cameras, and the survey written into <code>cameras.local.yaml</code>. Everything is computed in this page; nothing is uploaded.</div>
 
 <div class="layout">
   <div class="col">
     <div class="panel">
-      <h2>Surveyed points</h2>
-      <div class="hint">Heights are the receiver's MSL height, as the console records them. "Mount" is how far the camera sits above the surveyed spot (0 if the antenna was held at the camera).</div>
+      <h2>1. Points</h2>
+      <div class="hint">Survey <b>origin</b>, <b>camera_a</b>, <b>camera_b</b> on the Survey console (plus any reference points for north alignment, under any other name), then load them here.</div>
       <div class="btns">
         <button id="loadSurvey">Load survey results</button>
         <button id="clearPoints" class="secondary">Clear</button>
       </div>
       <div id="surveyNote" class="src"></div>
       <div id="pointForms"></div>
+      <h4>Reference points (for aiming / north alignment)</h4>
+      <div id="refForms"></div>
+      <button id="addRef" class="secondary">+ Add reference point</button>
     </div>
 
     <div class="panel">
-      <h2>Plan (optional)</h2>
-      <div class="hint">The tape-measure layout from the config: poles <code>pole_distance_m</code> apart, camera_b at <code>pole_line_bearing_deg</code> from camera_a, origin halfway between. Fill it in to see how far each pole is from where it should be.</div>
-      <div class="row">
-        <div><label for="planDist">pole_distance_m</label><input id="planDist" inputmode="decimal" placeholder="e.g. 50"></div>
-        <div><label for="planBearing">pole_line_bearing_deg</label><input id="planBearing" inputmode="decimal" placeholder="e.g. 90"></div>
-      </div>
-      <label for="decl">Magnetic declination, ° east (optional, for a hand compass)</label>
-      <input id="decl" inputmode="decimal" placeholder="e.g. -0.6 (west is negative)">
-    </div>
-
-    <div class="panel">
-      <h2>cameras.local.yaml</h2>
-      <div class="hint">Paste the file to read its values, or to write the survey into it (origin, each pole's origin_e/n/u, pole_distance_m: 0.0 - the same edits as <code>survey.py point --write</code>). It stays in this tab and is never saved or sent anywhere.</div>
-      <textarea id="cfgIn" spellcheck="false" placeholder="paste hawk_nest/config/cameras.local.yaml here"></textarea>
+      <h2>2. cameras.local.yaml</h2>
+      <div class="hint">Open the tracker's settings file, write the survey into it, save. Only the site origin, each camera's <code>origin_e/n/u</code> and <code>pole_distance_m: 0.0</code> change; you see every changed line first.</div>
       <div class="btns">
-        <button id="cfgRead" class="secondary">Read values from it</button>
-        <button id="cfgWrite">Write survey into it</button>
+        <button id="cfgOpen">Open file...</button>
+        <button id="cfgWrite" disabled>Write survey into it</button>
       </div>
-      <div id="cfgMsg" class="src"></div>
-      <div id="cfgOutWrap" style="display:none">
-        <label for="cfgOut">Updated file</label>
-        <textarea id="cfgOut" spellcheck="false" readonly></textarea>
-        <div class="btns">
-          <button id="cfgCopy" class="secondary">Copy</button>
-          <button id="cfgDownload" class="secondary">Download cameras.local.yaml</button>
-        </div>
+      <input type="file" id="cfgFile" accept=".yaml,.yml,text/yaml" hidden>
+      <details style="margin-top:8px">
+        <summary>or paste it</summary>
+        <textarea id="cfgPaste" spellcheck="false" placeholder="paste hawk_nest/config/cameras.local.yaml here"></textarea>
+        <button id="cfgUsePaste" class="secondary">Use pasted text</button>
+      </details>
+      <div id="cfgMsg" class="msg"></div>
+      <div id="cfgChanges"></div>
+      <div id="cfgSaveRow" class="btns" style="display:none">
+        <button id="cfgSave">Save to the file</button>
+        <button id="cfgDownload" class="secondary">Download</button>
+        <button id="cfgCopy" class="secondary">Copy</button>
       </div>
+      <button id="cfgReadPoints" class="secondary" style="display:none">Use the file's values as the points</button>
       <details style="margin-top:10px">
-        <summary class="src" style="cursor:pointer">No file at hand? Values to paste by hand</summary>
+        <summary>No file at hand? Values to type in by hand</summary>
         <pre id="snippet" class="snippet"></pre>
+      </details>
+    </div>
+
+    <div class="panel">
+      <details id="planBox">
+        <summary style="font-size:14px;color:var(--text);font-weight:600">Compare with a planned layout (optional)</summary>
+        <div class="hint" style="margin-top:6px">The tape-measure layout: poles <code>pole_distance_m</code> apart, camera_b at <code>pole_line_bearing_deg</code> from camera_a, origin halfway. Shows how far each pole is from it.</div>
+        <div class="row">
+          <div><label for="planDist">pole_distance_m</label><input id="planDist" inputmode="decimal" placeholder="e.g. 50"></div>
+          <div><label for="planBearing">pole_line_bearing_deg</label><input id="planBearing" inputmode="decimal" placeholder="e.g. 90"></div>
+        </div>
+        <label for="decl">Magnetic declination, ° east (for a hand compass; west is negative)</label>
+        <input id="decl" inputmode="decimal" placeholder="e.g. -0.6">
       </details>
     </div>
   </div>
@@ -127,37 +146,46 @@
   <div class="col results">
     <div class="panel">
       <h2>Between the poles</h2>
-      <div id="pairOut"><div class="empty">Enter or load both poles to see distance and bearing.</div></div>
+      <div id="pairOut"><div class="empty">Load or enter both poles.</div></div>
       <div id="warnings"></div>
     </div>
 
     <div class="panel">
-      <h2>Map</h2>
-      <div id="map"></div>
-      <div id="mapNote" class="note">Satellite imagery is typically off by 1-3 m; the numbers and the site plot below are the survey-grade view.</div>
-      <div class="maptools">
-        <button id="fitMap" class="secondary">Fit to points</button>
+      <div class="tabs">
+        <button id="tabMap" class="on">Satellite map</button>
+        <button id="tabPlot">Exact plot (metres)</button>
+      </div>
+      <div id="mapView">
+        <div id="map"></div>
+        <div class="viewtools">
+          <button id="fitMap" class="secondary">Fit to points</button>
+          <span id="mapNote">Imagery is typically 1-3 m off; the exact plot and numbers are survey-grade.</span>
+        </div>
+      </div>
+      <div id="plotView" hidden>
+        <svg id="plot" role="img" aria-label="Site plot in metres east and north of the origin"></svg>
+        <div class="viewtools">
+          <label for="exag" style="margin:0">Pole offsets from plan drawn</label>
+          <select id="exag"><option value="1">x1 (true scale)</option><option value="10">x10</option><option value="100">x100</option></select>
+          <span id="plotScale"></span>
+        </div>
       </div>
     </div>
 
-    <div class="panel">
-      <h2>Site plot (exact metres, north up)</h2>
-      <svg id="plot" role="img" aria-label="Site plot in metres east and north of the origin"></svg>
-      <div class="maptools">
-        <label for="exag" style="margin:0">Plan errors drawn</label>
-        <select id="exag"><option value="1">x1 (true scale)</option><option value="10">x10</option><option value="100">x100</option></select>
-        <span id="plotScale"></span>
-      </div>
+    <div class="panel" id="planPanel" hidden>
+      <h2>Corrections vs plan</h2>
+      <div id="planOut"></div>
     </div>
 
     <div class="panel">
-      <h2>Corrections</h2>
-      <div id="planOut"><div class="empty">Fill in the plan to see how far each pole is from it.</div></div>
+      <h2>Aim the cameras (north alignment)</h2>
+      <div class="hint">Where each camera must point to see each reference point, in the tracker's own frame. For <code>calibrate_ptz.py sight</code>, replace <code>&lt;lat&gt;,&lt;lon&gt;,&lt;alt_m&gt;</code> with the copied value. Points further away give a better alignment.</div>
+      <div id="aimOut"><div class="empty">Needs the origin and a camera.</div></div>
     </div>
 
     <div class="panel">
-      <h2><span class="dot" style="background:var(--live)"></span>Live rover - walk to a spot</h2>
-      <div class="hint">Open the Survey console in another tab of this browser and start the rover's Live monitor; its position shows here live, with directions to the chosen target.</div>
+      <h2><span class="dot" style="background:var(--accent)"></span> Live rover - walk to a spot</h2>
+      <div class="hint">Run the rover's Live monitor on the Survey console in another tab of this browser; its position shows here with directions to the target.</div>
       <label for="target">Target</label>
       <select id="target"></select>
       <div id="liveOut" class="live">waiting for the console's rover...</div>

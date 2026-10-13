@@ -78,26 +78,62 @@ test("planned pole positions match site_layout.camera_origins", { skip: !haveTra
   }
 });
 
-test("writing cameras.yaml is byte-identical to survey.py point --write", { skip: !haveTracker && "Ground_EO_Tracker not found" }, () => {
-  const y = V.tracker.yaml;
+/** The site from the vectors as SiteCalc input (the page holds the same rounded values). */
+function yamlSite(y) {
   const [olat, olon, oh] = y.origin;
-  const site = { origin: { lat: olat, lon: olon, h: oh }, poles: {}, plan: null, declinationDeg: null };
-  for (const [id, [lat, lon, h]] of Object.entries(y.poles)) site.poles[id] = { lat, lon, h, mount: 0 };
+  const site = { origin: { lat: olat, lon: olon, h: oh }, poles: {}, refs: [], plan: null, declinationDeg: null };
+  for (const [id, [lat, lon, h]] of Object.entries(y.poles)) site.poles[id] = { lat, lon, h, mount: y.mounts[id], sigma: 0.008 };
+  for (const r of y.refs) site.refs.push({ name: r.name, lat: r.geo[0], lon: r.geo[1], h: r.geo[2], above: r.above, sigma: 0.01 });
+  return site;
+}
+
+test("writes the template's survey lines only; output handed to check_site_config.py", { skip: !haveTracker && "Ground_EO_Tracker not found" }, () => {
+  const y = V.tracker.yaml;
+  const site = yamlSite(y);
   const an = C.analyzeSite(site);
   const r = C.applyToConfig(y.template, an, site.origin);
   assert.deepEqual(r.written, ["camera_a", "camera_b"]);
-  if (r.text !== y.expected) {
-    const a = r.text.split("\n"), b = y.expected.split("\n");
-    for (let i = 0; i < Math.max(a.length, b.length); i++) if (a[i] !== b[i]) assert.fail(`line ${i + 1}:\n  ours:      ${a[i]}\n  survey.py: ${b[i]}`);
-  }
-  // and reading it back gives the same points to well under a millimetre
-  const cfg = C.parseConfig(r.text);
-  assert.equal(cfg.poleDistanceM, 0);
-  const pts = C.pointsFromConfig(cfg);
+  const changes = C.configChanges(y.template, r.text);
+  assert.deepEqual(changes.map((c) => c.key).sort(),
+    ["origin_alt_m", "origin_e", "origin_e", "origin_lat_deg", "origin_lon_deg", "origin_n", "origin_n", "origin_u", "origin_u", "pole_distance_m"]);
+  assert.equal(r.text.split("\n").length, y.template.split("\n").length);
+  // writing again over the written file changes nothing
+  assert.deepEqual(C.configChanges(r.text, C.applyToConfig(r.text, an, site.origin).text), []);
+  // reading it back gives the cameras (antenna + mount) to well under a millimetre
+  const pts = C.pointsFromConfig(C.parseConfig(r.text));
   for (const [id, [lat, lon, h]] of Object.entries(y.poles)) {
     const d = C.inverse(lat, lon, pts.poles[id].lat, pts.poles[id].lon).distanceM;
-    assert.ok(d < 2e-4 && Math.abs(pts.poles[id].h - h) < 2e-4, `${id} read back ${d} m / ${pts.poles[id].h - h} m off`);
+    assert.ok(d < 2e-4 && Math.abs(pts.poles[id].h - (h + y.mounts[id])) < 2e-4, `${id} read back ${d} m / ${pts.poles[id].h - h} m off`);
   }
+  const sightings = Object.fromEntries(Object.entries(an.sightings).map(([id, rows]) => [id, rows.map((x) => ({ name: x.name, csv: x.csv, azDeg: x.azDeg, elDeg: x.elDeg }))]));
+  assert.deepEqual(sightings.camera_a.map((x) => x.name), ["camera_b (camera)", "mast", "stake1"]);
+  fs.writeFileSync(path.join(__dirname, "..", "oracle", "js_site.json"),
+    JSON.stringify({ template: y.template, written: r.text, origin: y.origin, poles: y.poles, mounts: y.mounts, sightings }));
+});
+
+test("sightings: az/el from each camera, ref_alt includes the sighted height, uncertainty", () => {
+  const o = { lat: 12.9715987, lon: 77.5945627, h: 920.0 };
+  const f = new W.LocalFrame(o.lat, o.lon, o.h);
+  const geo = (e, n, u) => { const [lat, lon, h] = f.enuToGeodetic(e, n, u); return { lat, lon, h }; };
+  const site = {
+    origin: o,
+    poles: { camera_a: { ...geo(-25, 0, 0), mount: 3, sigma: 0.01 }, camera_b: { ...geo(25, 0, 0), mount: 3, sigma: 0.01 } },
+    refs: [{ name: "mast", ...geo(-25, 400, 0), above: 3, sigma: 0.01 }, { name: "bad", lat: 999, lon: 0, h: 0 }],
+    plan: null, declinationDeg: null,
+  };
+  const an = C.analyzeSite(site);
+  const mast = an.sightings.camera_a.find((x) => x.name === "mast");
+  assert.ok(Math.abs(mast.azDeg - 0) < 1e-6 || Math.abs(mast.azDeg - 360) < 1e-6, `due north: ${mast.azDeg}`);
+  // both built on the tracker's (flat) frame at u = 0, then raised 3 m: level with the camera
+  assert.ok(Math.abs(mast.elDeg) < 1e-6, `elevation ${mast.elDeg}`);
+  // the 3 m goes along the mast's own vertical, tilted 400 m / R from the frame's: ~0.2 mm sideways
+  assert.ok(Math.abs(mast.horizM - 400) < 5e-4, `horizontal ${mast.horizM}`);
+  assert.ok(Math.abs(mast.sigmaMrad - Math.atan2(Math.hypot(0.01, 0.01), mast.horizM) * 1000) < 1e-12);
+  assert.match(mast.csv, /^12\.97\d+,77\.59\d+,923\.0\d\d$/);
+  const other = an.sightings.camera_a.find((x) => x.name === "camera_b (camera)");
+  assert.ok(Math.abs(other.azDeg - 90) < 1e-6 && Math.abs(other.horizM - 50) < 1e-4, `${other.azDeg} ${other.horizM}`); // mounts tilt apart by 50 m / R
+  assert.equal(an.sightings.camera_a.length, 2, "an invalid reference point is skipped, a camera never sights itself");
+  assert.equal(C.analyzeSite({ ...site, origin: null }).sightings.camera_a, undefined, "needs the origin");
 });
 
 test("analyzeSite: distances, bearings, corrections and warnings on a known layout", () => {

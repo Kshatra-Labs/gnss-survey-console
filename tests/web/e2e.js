@@ -276,8 +276,9 @@ async function main() {
 
   const sitePage = await loadPage(new URL("site.html", pageUrl).href, { storage: { gnss_survey_results: JSON.stringify(saved) } });
   const s$ = sitePage.$;
-  assert.match(s$("mapNote").textContent, /didn't load/, "no Leaflet -> fallback note, page still works");
-  assert.match(s$("surveyNote").textContent, /origin .*camera_a .*camera_b/);
+  assert.match(s$("mapNote").textContent, /couldn't load/, "no Leaflet -> fallback note, page still works");
+  assert.equal(s$("plotView").hidden, false, "no map library -> the exact plot is shown instead");
+  assert.match(s$("surveyNote").textContent, /in this browser: origin, camera_a, camera_b/);
   s$("loadSurvey").click();
   const site = {
     origin: { lat: saved.origin.lat_deg, lon: saved.origin.lon_deg, h: saved.origin.height_msl_m },
@@ -286,7 +287,7 @@ async function main() {
   };
   const an = SiteCalc.analyzeSite(site);
   const pairText = s$("pairOut").textContent;
-  const shownDist = Number(/Ground distance\s*([\d.]+) m/.exec(pairText)[1]);
+  const shownDist = Number(/Distance\s*([\d.]+) m/.exec(pairText)[1]);
   const shownBear = Number(/Bearing camera_a → camera_b\s*([\d.]+)°/.exec(pairText)[1]);
   assert.ok(Math.abs(shownDist - an.pair.horizM) < 1.5e-3, `distance shown ${shownDist} vs ${an.pair.horizM}`);
   assert.ok(Math.abs(shownBear - an.pair.trueBearingAB) < 2e-3, `bearing shown ${shownBear} vs ${an.pair.trueBearingAB}`);
@@ -313,7 +314,7 @@ async function main() {
   const liveText = s$("liveOut").textContent;
   const off = /camera_b \(surveyed\): (in place|(\d+\.\d+) m)/.exec(liveText);
   assert.ok(off && (off[1] === "in place (< 1 mm)" || Number(off[2]) < 0.02), `rover at camera_b should be ~0 m away:\n${liveText}`);
-  log("live rover from the console tab -> " + liveText.split("\n").find((l) => /camera_b/.test(l)));
+  log("live rover from the console tab -> " + s$("liveOut").querySelector(".big").textContent);
   p.$("usbStop").click();
   await waitFor(p, () => /monitor stopped/.test(text(p, "usbStatus")) && !p.$("usbStart").disabled, 10000, "monitor stops");
   listener.close();
@@ -322,9 +323,13 @@ async function main() {
   const yaml = "ground_tracker_node:\n  ros__parameters:\n    local_frame:\n      origin_lat_deg: 0.0\n      origin_lon_deg: 0.0\n      origin_alt_m: 0.0\n" +
     "    pole_distance_m: 50.0\n    camera_ids: [\"camera_a\", \"camera_b\"]\n    camera_a:\n      host: \"x\"\n      origin_e: 0.0\n      origin_n: 0.0\n      origin_u: 0.0   # m\n" +
     "    camera_b:\n      origin_e: 0.0\n      origin_n: 0.0\n      origin_u: 0.0\n";
-  s$("cfgIn").value = yaml;
+  s$("cfgPaste").value = yaml;
+  s$("cfgUsePaste").click();
+  assert.match(s$("cfgMsg").textContent, /pasted text: cameras camera_a, camera_b; pole_distance_m 50; origin not set yet/);
   s$("cfgWrite").click();
-  const outYaml = s$("cfgOut").value;
+  assert.equal(s$("cfgChanges").querySelectorAll("tr.changed").length, 10, "10 survey lines shown as changes");
+  assert.equal(s$("cfgSave").hidden, true, "pasted text has no file to save to: Download/Copy only");
+  const outYaml = sitePage.win.eval("cfg.pending");
   // same values as computing directly from the saved results (the page keeps 0.1 mm)
   const got = SiteCalc.parseConfig(outYaml);
   assert.equal(got.poleDistanceM, 0);

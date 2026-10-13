@@ -1,7 +1,8 @@
 // The Site map in real headless Chrome (DevTools protocol): Leaflet map with
 // tiles, two tabs of one browser sharing survey results (localStorage) and the
-// live rover (BroadcastChannel) through the console's real functions, and the
-// written cameras.yaml compared byte for byte with survey.py's own writer.
+// live rover (BroadcastChannel) through the console's real functions, the aim
+// panel, and Open file... -> Write survey into it -> Save to the file giving
+// exactly the text that check_site_config.py verified with the tracker's code.
 //
 //   NODE_PATH=<dir with ws> node tests/web/site_browser.js [--page https://...] [--shots DIR]
 "use strict";
@@ -117,99 +118,134 @@ async function main() {
     await waitHttp(`http://127.0.0.1:${cdpPort}/json/version`, 20000);
     const y = V.tracker && V.tracker.yaml;
     assert.ok(y, "needs tests/oracle/site_vectors.json generated with Ground_EO_Tracker present");
+    const C = require("../../web/sitecalc.js");
 
-    // tab 1: the console, saving three results through its real function
+    // what the page must show / write: the same inputs through sitecalc.js under Node
+    // (whose output check_site_config.py verifies with the tracker's own code)
+    const site = { origin: { lat: y.origin[0], lon: y.origin[1], h: y.origin[2] }, poles: {}, refs: [], plan: null, declinationDeg: null };
+    for (const id of ["camera_a", "camera_b"]) site.poles[id] = { lat: y.poles[id][0], lon: y.poles[id][1], h: y.poles[id][2], mount: y.mounts[id], sigma: 0.008 };
+    for (const r of y.refs) site.refs.push({ name: r.name, lat: r.geo[0], lon: r.geo[1], h: r.geo[2], above: r.above, sigma: 0.01 });
+    const expect = C.analyzeSite(site);
+    const expectedYaml = C.applyToConfig(y.template, expect, site.origin).text;
+
+    // tab 1: the console saves every point through its real function
     const consoleTab = await Tab.open(cdpPort, pageBase + "index.html");
     await consoleTab.waitFor("typeof saveSurveyResult === 'function' && document.readyState === 'complete'", 15000, "console loaded");
-    const pts = { origin: y.origin, camera_a: y.poles.camera_a, camera_b: y.poles.camera_b };
-    for (const [label, [lat, lon, h]] of Object.entries(pts)) {
-      assert.equal(await consoleTab.eval(`saveSurveyResult(${JSON.stringify({ label, lat_deg: lat, lon_deg: lon, height_msl_m: h, n: 60, spread_m: 0.008, all_fixed: true })})`), true);
+    const results = [["origin", y.origin, 0.008], ["camera_a", y.poles.camera_a, 0.008], ["camera_b", y.poles.camera_b, 0.008],
+      ...y.refs.map((r) => [r.name, r.geo, 0.01])];
+    for (const [label, [lat, lon, h], spread] of results) {
+      assert.equal(await consoleTab.eval(`saveSurveyResult(${JSON.stringify({ label, lat_deg: lat, lon_deg: lon, height_msl_m: h, n: 60, spread_m: spread, all_fixed: true })})`), true);
     }
     assert.equal(await consoleTab.eval("document.querySelector('.nav a[href=\"site.html\"]') !== null"), true);
-    log("console tab saved origin / camera_a / camera_b via saveSurveyResult(); nav links to Site map");
+    log(`console tab saved ${results.map((r) => r[0]).join(", ")} via saveSurveyResult()`);
 
-    // tab 2: the Site map
-    const site = await Tab.open(cdpPort, pageBase + "site.html");
-    await site.waitFor("document.readyState === 'complete' && typeof SiteCalc === 'object'", 15000, "site loaded");
-    assert.equal(await site.eval("typeof L"), "object", "Leaflet loaded from cdnjs (SRI ok)");
-    await site.eval("document.getElementById('loadSurvey').click()");
-    const pair = await site.eval("document.getElementById('pairOut').innerText");
-    const expect = (() => {
-      const C = require("../../web/sitecalc.js");
-      const s = { origin: { lat: y.origin[0], lon: y.origin[1], h: y.origin[2] }, poles: {}, plan: null, declinationDeg: null };
-      for (const id of ["camera_a", "camera_b"]) s.poles[id] = { lat: pts[id][0], lon: pts[id][1], h: pts[id][2], mount: 0, sigma: 0.008 };
-      return C.analyzeSite(s);
-    })();
+    // tab 2: the Site map - load, then type the mounts / sighted height like a user
+    const site2 = await Tab.open(cdpPort, pageBase + "site.html");
+    const tab = site2;
+    await tab.waitFor("document.readyState === 'complete' && typeof SiteCalc === 'object'", 15000, "site loaded");
+    assert.equal(await tab.eval("typeof L"), "object", "Leaflet loaded from cdnjs (SRI ok)");
+    await tab.eval("document.getElementById('loadSurvey').click(); 1");
+    await tab.eval(`(() => {
+      const set = (sel, v) => { const e = document.querySelector(sel); e.value = v; e.dispatchEvent(new Event('input')); };
+      set('[data-point="camera_a"] input[data-key="mount"]', '${y.mounts.camera_a}');
+      set('[data-point="camera_b"] input[data-key="mount"]', '${y.mounts.camera_b}');
+      ${y.refs.map((r, i) => `set('[data-ref="${i}"] input[data-key="above"]', '${r.above}');`).join("\n")}
+    })()`);
+    assert.equal(await tab.eval("state.points.camera_a.sigma"), 0.008, "typing a mount keeps the survey spread");
+    assert.equal(await tab.eval("state.refs.map((r) => r.name).join()"), y.refs.map((r) => r.name).join(), "other labels became reference points");
+
+    const pair = await tab.eval("document.getElementById('pairOut').innerText");
     assert.ok(pair.includes(`${expect.pair.horizM.toFixed(3)} m`), `distance missing:\n${pair}`);
     assert.ok(pair.includes(`${expect.pair.trueBearingAB.toFixed(3)}°`) && pair.includes(`${expect.pair.trueBearingBA.toFixed(3)}°`), "bearings missing");
-    log(`Site map tab: ${expect.pair.horizM.toFixed(3)} m, ${expect.pair.trueBearingAB.toFixed(3)}° / ${expect.pair.trueBearingBA.toFixed(3)}° between the poles`);
+    for (const id of ["camera_a", "camera_b"]) assert.ok(pair.includes(expect.poles[id].enu[2].toFixed(4)), `${id} origin_u (with mount) missing`);
+    log(`Site map: ${expect.pair.horizM.toFixed(3)} m, ${expect.pair.trueBearingAB.toFixed(3)}° / ${expect.pair.trueBearingBA.toFixed(3)}°, origin_u with mounts`);
 
-    const nShapes = await site.waitFor("document.querySelectorAll('#map .leaflet-interactive').length >= 4 && document.querySelectorAll('#map .leaflet-interactive').length", 10000, "map markers");
-    const tiles = await site.waitFor("document.querySelectorAll('#map img.leaflet-tile-loaded').length", 20000, "satellite tiles");
-    log(`Leaflet map: ${nShapes} shapes drawn, ${tiles} satellite tiles loaded`);
+    const aim = await tab.eval("document.getElementById('aimOut').innerText");
+    for (const id of ["camera_a", "camera_b"]) {
+      for (const sgt of expect.sightings[id]) {
+        assert.ok(aim.includes(sgt.csv) && aim.includes(`${sgt.azDeg.toFixed(3)}°`) && aim.includes(`±${sgt.sigmaMrad.toFixed(2)}`), `${id} -> ${sgt.name} missing:\n${aim}`);
+      }
+    }
+    log(`aim panel: ${expect.sightings.camera_a.length} targets per camera with az/el and ref_lat,ref_lon,ref_alt (as check_site_config.py verified)`);
 
-    // plan + declination + mount, through the real inputs
-    await site.eval(`(() => {
-      const set = (id, v) => { const e = document.getElementById(id); e.value = v; e.dispatchEvent(new Event('input')); };
-      set('planDist', '${(expect.pair.horizM + 0.25).toFixed(2)}'); set('planBearing', '${Math.round(expect.pair.enuBearingAB)}'); set('decl', '-1.2');
-    })()`);
-    const planText = await site.eval("document.getElementById('planOut').innerText");
-    assert.match(planText, /Distance vs plan[\s\S]*Bearing vs plan[\s\S]*move camera_a: [\s\S]*move camera_b: /);
-    const svgN = await site.eval("document.querySelectorAll('#plot circle').length");
-    assert.equal(svgN, 5, "site plot: origin, 2 poles, 2 planned");
-    log("plan entered -> corrections + plan markers on map and site plot");
+    const nShapes = await tab.waitFor("document.querySelectorAll('#map .leaflet-interactive').length >= 6 && document.querySelectorAll('#map .leaflet-interactive').length", 10000, "map markers");
+    const tiles = await tab.waitFor("document.querySelectorAll('#map img.leaflet-tile-loaded').length", 20000, "satellite tiles");
+    log(`Leaflet map: ${nShapes} shapes, ${tiles} satellite tiles loaded`);
 
-    // live rover: the console's real shareLive() -> other tab
-    const [lat, lon, h] = pts.camera_b;
+    // plan -> corrections panel appears; exact plot draws everything
+    await tab.eval(`(() => { const set = (id, v) => { const e = document.getElementById(id); e.value = v; e.dispatchEvent(new Event('input')); };
+      set('planDist', '${(expect.pair.horizM + 0.25).toFixed(2)}'); set('planBearing', '${Math.round(expect.pair.enuBearingAB)}'); })()`);
+    assert.equal(await tab.eval("document.getElementById('planPanel').hidden"), false);
+    assert.match(await tab.eval("document.getElementById('planOut').innerText"), /Distance vs plan[\s\S]*move camera_a: [\s\S]*move camera_b: /);
+    await tab.eval("document.getElementById('tabPlot').click(); 1");
+    assert.equal(await tab.eval("document.querySelectorAll('#plot circle').length"), 3 + 2 + y.refs.length, "plot: origin, 2 poles, 2 planned, refs");
+    await tab.eval("document.getElementById('tabMap').click(); 1");
+    log("plan -> corrections panel; exact plot draws origin, poles, plan and reference points");
+
+    // live rover: the console's real shareLive() -> this tab
+    const [lat, lon, h] = y.poles.camera_b;
     await consoleTab.eval(`shareLive({ fixType: 3, latDeg: ${lat} + 0.3 / 110600, lonDeg: ${lon}, heightMslM: ${h} + 1.0, carrSoln: 2, hAccM: 0.012, numSv: 22 })`);
-    await site.eval("const t = document.getElementById('target'); t.value = 'pole:camera_b'; t.dispatchEvent(new Event('change')); 1");
-    const live = await site.waitFor("/FIX=true/.test(document.getElementById('liveOut').innerText) && document.getElementById('liveOut').innerText", 5000, "live rover in the Site map tab");
+    await tab.eval("const t = document.getElementById('target'); t.value = 'pole:camera_b'; t.dispatchEvent(new Event('change')); 1");
+    const live = await tab.waitFor("/FIX=true/.test(document.getElementById('liveOut').innerText) && document.getElementById('liveOut').innerText", 5000, "live rover");
     assert.match(live, /camera_b \(surveyed\): 0\.(29|30)\d m towards 180\.0° \(0\.(29|30)\d m S, 0\.000 m [EW]\)/, live);
     assert.match(live, /target is 1\.000 m below the rover antenna/);
-    log("live rover crossed tabs (BroadcastChannel): " + live.split("\n").find((l) => /camera_b/.test(l)));
+    log("live rover crossed tabs: " + live.split("\n").find((l) => /camera_b/.test(l)));
 
-    // write the committed cameras.yaml template; must equal survey.py point --write
-    await site.eval(`(() => { const e = document.getElementById('cfgIn'); e.value = ${JSON.stringify(y.template)}; document.getElementById('cfgWrite').click(); })()`);
-    const out = await site.eval("document.getElementById('cfgOut').value");
-    if (out !== y.expected) {
-      const a = out.split("\n"), b = y.expected.split("\n");
-      for (let i = 0; i < Math.max(a.length, b.length); i++) if (a[i] !== b[i]) assert.fail(`cameras.yaml line ${i + 1}:\n  page:      ${a[i]}\n  survey.py: ${b[i]}`);
+    // the guide's flow: Open file... -> Write survey into it -> Save to the file
+    // (a stand-in file handle: the native picker can't be clicked headless)
+    await tab.eval(`(() => {
+      window.__disk = ${JSON.stringify(y.template)};
+      const handle = {
+        getFile: async () => new File([window.__disk], "cameras.local.yaml"),
+        createWritable: async () => { let buf = ""; return { write: async (t) => { buf += t; }, close: async () => { window.__disk = buf; } }; },
+      };
+      window.showOpenFilePicker = async () => [handle];
+    })()`);
+    await tab.eval("document.getElementById('cfgOpen').click(); 1");
+    await tab.waitFor("!document.getElementById('cfgWrite').disabled", 5000, "file opened");
+    assert.match(await tab.eval("document.getElementById('cfgMsg').innerText"), /cameras\.local\.yaml: cameras camera_a, camera_b; pole_distance_m 50; origin not set yet/);
+    await tab.eval("document.getElementById('cfgWrite').click(); 1");
+    const changes = await tab.eval("[...document.querySelectorAll('#cfgChanges tr.changed')].map((r) => r.innerText)");
+    assert.equal(changes.length, 10, `changed lines:\n${changes.join("\n")}`);
+    assert.match(await tab.eval("document.getElementById('cfgMsg').innerText"), /10 line\(s\) will change/);
+    assert.equal(await tab.eval("document.getElementById('cfgSave').hidden"), false);
+    await tab.eval("document.getElementById('cfgSave').click(); 1");
+    await tab.waitFor("/saved .* read it back/.test(document.getElementById('cfgMsg').innerText)", 5000, "saved");
+    const disk = await tab.eval("window.__disk");
+    if (disk !== expectedYaml) {
+      const a = disk.split("\n"), b = expectedYaml.split("\n");
+      for (let i = 0; i < Math.max(a.length, b.length); i++) if (a[i] !== b[i]) assert.fail(`saved file line ${i + 1}:\n  page: ${a[i]}\n  node: ${b[i]}`);
     }
-    log(`written cameras.yaml is byte-identical to survey.py point --write (${out.length} bytes)`);
+    log(`Open file... -> Write survey into it (10 changed lines shown) -> Save to the file: saved text identical to the verified output`);
+    await tab.eval("document.getElementById('cfgWrite').click(); 1");
+    assert.match(await tab.eval("document.getElementById('cfgChanges').innerText"), /already holds exactly these values/);
+    log("writing again: 'the file already holds exactly these values'");
 
-    // reading it back restores the same points
-    await site.eval("document.getElementById('cfgIn').value = document.getElementById('cfgOut').value; document.getElementById('cfgRead').click(); 1");
-    assert.match(await site.eval("document.getElementById('cfgMsg').innerText"), /read origin \+ 2 pole\(s\)/);
-    const pair2 = await site.eval("document.getElementById('pairOut').innerText");
-    assert.ok(pair2.includes(`${expect.pair.horizM.toFixed(3)} m`), "distance after reading the config back");
-    log("reading the written config back gives the same distance");
-
-    // reload keeps the page state; errors none
-    await site.send("Page.reload");
-    await site.waitFor("document.readyState === 'complete' && document.getElementById('pairOut').innerText.includes('Ground distance')", 15000, "state after reload");
+    // reload keeps the page state
+    await tab.send("Page.reload");
+    await tab.waitFor("document.readyState === 'complete' && document.getElementById('pairOut').innerText.includes('Height difference')", 15000, "state after reload");
     log("page state survives a reload");
 
     if (shots) {
       fs.mkdirSync(shots, { recursive: true });
-      await consoleTab.eval(`shareLive({ fixType: 3, latDeg: ${lat} + 0.3 / 110600, lonDeg: ${lon}, heightMslM: ${h} + 1.0, carrSoln: 2, hAccM: 0.012, numSv: 22 })`);
-      // a typical site for the pictures: origin at the midpoint, poles ~50 m apart near 90 deg
-      await site.eval(`(() => { const set = (id, v) => { const e = document.getElementById(id); e.value = v; e.dispatchEvent(new Event('input')); };
+      // a typical site for the pictures: origin at the midpoint, poles ~50 m apart near 90 deg, two far references
+      await tab.eval(`(() => { const set = (sel, v) => { const e = document.querySelector(sel); e.value = v; e.dispatchEvent(new Event('input')); };
         const f = new Wgs84.LocalFrame(${y.origin[0]}, ${y.origin[1]}, ${y.origin[2]});
-        const put = (l, e, n, u, mount) => { const g = f.enuToGeodetic(e, n, u); set('pt_' + l + '_lat', g[0].toFixed(9)); set('pt_' + l + '_lon', g[1].toFixed(9)); set('pt_' + l + '_h', g[2].toFixed(4)); if (mount != null) set('pt_' + l + '_mount', mount); };
-        put('origin', 0, 0, 0); put('camera_a', -24.93, -0.42, 0.31, '3.2'); put('camera_b', 25.12, 0.18, -0.12, '3.2');
-        set('planDist', '50'); set('planBearing', '90'); })()`);
+        const put = (sel, e, n, u) => { const g = f.enuToGeodetic(e, n, u); set(sel + ' input[data-key="lat"]', g[0].toFixed(9)); set(sel + ' input[data-key="lon"]', g[1].toFixed(9)); set(sel + ' input[data-key="h"]', g[2].toFixed(4)); };
+        put('[data-point="camera_a"]', -24.93, -0.42, 0.31); put('[data-point="camera_b"]', 25.12, 0.18, -0.12);
+        put('[data-ref="0"]', 60, 140, 8); put('[data-ref="1"]', -90, 110, -1);
+        set('#planDist', '50'); set('#planBearing', '90'); })()`);
       await consoleTab.eval(`(() => { const g = new Wgs84.LocalFrame(${y.origin[0]}, ${y.origin[1]}, ${y.origin[2]}).enuToGeodetic(24.6, 3.1, 0.2);
         shareLive({ fixType: 3, latDeg: g[0], lonDeg: g[1], heightMslM: g[2], carrSoln: 2, hAccM: 0.011, numSv: 23 }); })()`);
-      await site.eval("const t = document.getElementById('target'); t.value = 'plan:camera_b'; t.dispatchEvent(new Event('change')); 1");
-      await site.eval("document.getElementById('fitMap').click(); 1");
-      const d = await site.shot(path.join(shots, "site-desktop.png"), 1280, 900);
-      const m = await site.shot(path.join(shots, "site-mobile.png"), 390, 844);
+      await tab.eval("const t = document.getElementById('target'); t.value = 'plan:camera_b'; t.dispatchEvent(new Event('change')); document.getElementById('fitMap').click(); 1");
+      const d = await tab.shot(path.join(shots, "site-desktop.png"), 1280, 900);
+      const m = await tab.shot(path.join(shots, "site-mobile.png"), 390, 844);
       assert.ok(m.scrollWidth <= 390, `horizontal scroll on a phone: ${m.scrollWidth}px`);
-      const c = await consoleTab.shot(path.join(shots, "console-top.png"), 1280, 600);
-      log(`screenshots in ${shots} (desktop ${d.height}px, phone ${m.height}px tall, no sideways scroll; console ${c.height}px)`);
+      const c = await consoleTab.shot(path.join(shots, "console.png"), 1280, 900);
+      log(`screenshots in ${shots} (desktop ${d.height}px, phone ${m.height}px, no sideways scroll; console ${c.height}px)`);
     }
 
-    const errs = [...consoleTab.errors, ...site.errors];
+    const errs = [...consoleTab.errors, ...tab.errors];
     assert.deepEqual(errs, [], "page errors");
     console.log("\nALL SITE MAP BROWSER CHECKS PASSED");
   } finally {

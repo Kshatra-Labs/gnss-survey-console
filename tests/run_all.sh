@@ -34,7 +34,11 @@ rm -f "$SIM_DUMP"
 
 echo "== site map math vs geographiclib / PROJ / Ground_EO_Tracker =="
 PYTHONPATH="$DEPS/py" python3 tests/oracle/gen_site_vectors.py > tests/oracle/site_vectors.json
+rm -f tests/oracle/js_site.json
 node --test tests/web/sitecalc.test.js
+if [ -f tests/oracle/js_site.json ]; then   # written by sitecalc.test.js when Ground_EO_Tracker is present
+  python3 tests/oracle/check_site_config.py tests/oracle/js_site.json
+fi
 
 echo "== relay server =="
 python3 tests/server/test_relay.py
@@ -44,7 +48,7 @@ NODE_PATH="$DEPS/node/node_modules" node tests/web/e2e.js
 
 CHROME=${CHROME:-$(command -v google-chrome || command -v chromium || command -v chromium-browser || true)}
 if [ -n "$CHROME" ] && grep -q '"yaml"' tests/oracle/site_vectors.json; then
-  echo "== site map in real Chrome (map, two tabs, config writer vs survey.py) =="
+  echo "== site map in real Chrome (map, two tabs, Open -> Write -> Save) =="
   CHROME="$CHROME" NODE_PATH="$DEPS/node/node_modules" node tests/web/site_browser.js
 else
   echo "== site map browser test SKIPPED (needs Chrome and Ground_EO_Tracker) =="

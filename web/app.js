@@ -19,7 +19,7 @@ async function checkRelay() {
   const ctl = new AbortController();
   relayCheckAbort = ctl;
   const el = $("relayHealth");
-  el.className = "status";
+  el.className = "status inline";
   el.textContent = "checking relay... (a sleeping free-tier relay can take up to a minute to wake)";
   const url = normalizeRelayUrl(serverUrl);
   const t = setTimeout(() => ctl.abort(), 75000);
@@ -29,8 +29,7 @@ async function checkRelay() {
     const r = await fetch(url + "/healthz", { cache: "no-store", signal: ctl.signal });
     if (!r.ok) throw new Error("HTTP " + r.status);
     const h = await r.json();
-    msg = `relay reachable: ${url}  (version ${h.version}${h.commit ? " / " + h.commit : ""}, ` +
-      `answered in ${Date.now() - t0} ms, active channels=${h.channels})`;
+    msg = `relay reachable: ${url}  (answered in ${Date.now() - t0} ms; version ${h.version}${h.commit ? " / " + h.commit : ""})`;
   } catch (e) {
     isErr = true;
     msg = `relay NOT reachable at ${url}: ${e.name === "AbortError" ? "no answer in 75 s" : e.message}`;
@@ -38,8 +37,9 @@ async function checkRelay() {
     clearTimeout(t);
   }
   if (seq !== relayCheckSeq) return; // a newer check (address changed) owns the display
-  el.className = isErr ? "status err" : "status";
+  el.className = isErr ? "status inline err" : "status inline";
   el.textContent = msg;
+  if (isErr) el.closest("details").open = true; // show the address to fix
 }
 
 $("serverConnect").onclick = () => {

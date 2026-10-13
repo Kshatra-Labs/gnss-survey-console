@@ -5,8 +5,8 @@ shares nothing with it:
   pyproj / PROJ   geodetic <-> ECEF, and ENU via PROJ's topocentric pipeline
   Ground_EO_Tracker itself (if checked out next to this repo, or at
   $GROUND_EO_TRACKER): geolocation.LocalFrame (the frame the tracker uses),
-  site_layout.camera_origins (planned pole positions), and survey.py's own
-  YAML writer applied to its committed cameras.yaml template.
+  site_layout.camera_origins (planned pole positions), and a site to write
+  into its committed cameras.yaml template (checked by check_site_config.py).
 
     PYTHONPATH=.test-deps/py python3 tests/oracle/gen_site_vectors.py > tests/oracle/site_vectors.json
 """
@@ -18,8 +18,6 @@ import math
 import os
 import random
 import sys
-import tempfile
-from types import SimpleNamespace
 
 from geographiclib.geodesic import Geodesic
 from pyproj import Transformer
@@ -87,15 +85,13 @@ def frame_cases():
 
 def tracker_dir():
     d = os.environ.get("GROUND_EO_TRACKER") or os.path.join(os.path.dirname(ROOT), "Ground_EO_Tracker")
-    return d if os.path.isfile(os.path.join(d, "tools", "gnss", "survey.py")) else None
+    return d if os.path.isfile(os.path.join(d, "hawk_nest", "hawk_nest", "site_layout.py")) else None
 
 
 def tracker_cases(tdir):
     sys.path.insert(0, os.path.join(tdir, "hawk_nest", "hawk_nest"))
-    sys.path.insert(0, os.path.join(tdir, "tools", "gnss"))
     import geolocation  # noqa: E402
     import site_layout  # noqa: E402
-    import survey  # noqa: E402
 
     frames = []
     for s in site_points():
@@ -108,28 +104,24 @@ def tracker_cases(tdir):
         o = site_layout.camera_origins(["camera_a", "camera_b"], dist, bearing, {"camera_a": (0, 0, 2.0), "camera_b": (0, 0, 3.0)})
         layouts.append({"dist": dist, "bearing": bearing, "a": list(o["camera_a"][:2]), "b": list(o["camera_b"][:2])})
 
-    # survey.py's own writer on the committed template: origin first, then each pole
-    template_path = os.path.join(tdir, "hawk_nest", "config", "cameras.yaml")
-    template = open(template_path).read()
+    # A site to write into the committed template (never cameras.local.yaml,
+    # which holds real passwords). Rounded to what the Site map page keeps
+    # (1e-9 deg, 0.1 mm), so the page in a browser gives the same text as
+    # sitecalc.js under Node; check_site_config.py then verifies that text
+    # with the tracker's own code.
+    template = open(os.path.join(tdir, "hawk_nest", "config", "cameras.yaml")).read()
     s = site_points()[0]
-    # rounded to what the Site map page keeps (1e-9 deg, 0.1 mm), so a browser
-    # run of the page can be compared byte for byte too
-    (olat, olon, oh) = (round(s["origin"][0], 9), round(s["origin"][1], 9), round(s["origin"][2], 4))
-    pts = [(round(a, 9), round(b, 9), round(c, 4)) for a, b, c in s["pts"]]
-    origin = SimpleNamespace(lat_deg=olat, lon_deg=olon, height_msl_m=oh)
-    with tempfile.TemporaryDirectory() as tmp:
-        path = os.path.join(tmp, "cameras.yaml")
-        with open(path, "w") as f:
-            f.write(template)
-        import contextlib
-        import io
-        with contextlib.redirect_stdout(io.StringIO()):
-            survey._write_survey_point(path, "origin", origin)
-            for label, (lat, lon, h) in zip(["camera_a", "camera_b"], pts):
-                survey._write_survey_point(path, label, SimpleNamespace(lat_deg=lat, lon_deg=lon, height_msl_m=h))
-        expected = open(path).read()
-    yaml_case = {"template": template, "origin": [olat, olon, oh],
-                 "poles": {"camera_a": list(pts[0]), "camera_b": list(pts[1])}, "expected": expected}
+    rnd = lambda p: [round(p[0], 9), round(p[1], 9), round(p[2], 4)]  # noqa: E731
+    frame = topocentric(*s["origin"])
+    far = [frame.transform(e, n, u, direction="INVERSE") for e, n, u in [(180.0, 420.0, 12.0), (-350.0, 260.0, -3.0)]]
+    yaml_case = {
+        "template": template,
+        "origin": rnd(s["origin"]),
+        "poles": {"camera_a": rnd(s["pts"][0]), "camera_b": rnd(s["pts"][1])},
+        "mounts": {"camera_a": 3.2, "camera_b": 2.75},
+        "refs": [{"name": "mast", "geo": rnd((far[0][1], far[0][0], far[0][2])), "above": 6.5},
+                 {"name": "stake1", "geo": rnd((far[1][1], far[1][0], far[1][2])), "above": 0.0}],
+    }
     return {"frames": frames, "layouts": layouts, "yaml": yaml_case}
 
 

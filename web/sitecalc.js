@@ -1,8 +1,9 @@
 // Site-layout math for the Site map page (site.html): geodesic distance and
-// bearing between the poles, each pole in the tracker's ENU frame, sight
-// angles camera-to-camera, plan-vs-survey corrections, and reading/writing
-// Ground_EO_Tracker's cameras.*.yaml. Pure functions - no DOM - so the tests
-// run them under Node against geographiclib and Ground_EO_Tracker's own code.
+// bearing between the poles, each pole in the tracker's ENU frame, where to
+// aim each camera at a reference point (north alignment), plan-vs-survey
+// corrections, and reading/writing Ground_EO_Tracker's cameras.*.yaml.
+// Pure functions - no DOM - so the tests run them under Node against
+// geographiclib, PROJ and Ground_EO_Tracker's own code.
 (function () {
   const W = typeof module !== "undefined" ? require("./wgs84.js") : window.Wgs84;
 
@@ -81,12 +82,14 @@
   /**
    * site = { origin: {lat, lon, h} | null,
    *          poles: { camera_a: {lat, lon, h, mount, sigma}, camera_b: {...} },
+   *          refs: [{name, lat, lon, h, above, sigma}],   reference points to sight
    *          plan: {distanceM, bearingDeg} | null, declinationDeg: number | null }
    * Heights are the receiver's MSL heights (what the console records); mount
-   * is the camera's height above the surveyed antenna position.
+   * is the camera's height above the surveyed antenna position, `above` the
+   * sighted feature's height above a reference point's surveyed spot.
    */
   function analyzeSite(site, ids = ["camera_a", "camera_b"]) {
-    const out = { ids, poles: {}, pair: null, plan: null, midpoint: null, frame: null, warnings: [] };
+    const out = { ids, poles: {}, pair: null, plan: null, midpoint: null, frame: null, sightings: {}, warnings: [] };
     const origin = validPoint(site.origin) ? site.origin : null;
     // The frame is built from the origin as it will be written to the config
     // (8 / 8 / 3 decimals), so the tracker gets exactly these pole offsets.
@@ -157,6 +160,41 @@
       out.plan = res;
     }
 
+    // North alignment (calibrate_ptz.py boresight): for each camera, every
+    // other pole's camera and every reference point, with the az/el the
+    // tracker will compute (ENU at the origin, camera_enu -> target_enu, as
+    // camera_model.bearing_from_position) and the ref_lat,ref_lon,ref_alt
+    // that go into the sightings CSV.
+    if (frame) {
+      const targets = [];
+      for (const id of ids) {
+        const p = out.poles[id];
+        if (p) targets.push({ name: `${id} (camera)`, of: id, geo: p.camera, enu: p.enu, sigma: p.sigma });
+      }
+      for (const r of site.refs || []) {
+        if (!validPoint(r)) continue;
+        const geo = { lat: r.lat, lon: r.lon, h: r.h + (isNum(r.above) ? r.above : 0) };
+        targets.push({ name: r.name, geo, enu: frame.geodeticToEnu(geo.lat, geo.lon, geo.h), sigma: isNum(r.sigma) ? r.sigma : null, allFixed: r.allFixed });
+      }
+      for (const id of ids) {
+        const cam = out.poles[id];
+        if (!cam) continue;
+        out.sightings[id] = targets.filter((t) => t.of !== id).map((t) => {
+          const de = t.enu[0] - cam.enu[0], dn = t.enu[1] - cam.enu[1], du = t.enu[2] - cam.enu[2];
+          const horizM = Math.hypot(de, dn);
+          const row = {
+            name: t.name, azDeg: norm360(deg(Math.atan2(de, dn))), elDeg: deg(Math.atan2(du, horizM)), horizM,
+            csv: `${t.geo.lat.toFixed(9)},${t.geo.lon.toFixed(9)},${t.geo.h.toFixed(3)}`,
+          };
+          if (cam.sigma !== null && t.sigma !== null && horizM > 0) row.sigmaMrad = Math.atan2(Math.hypot(cam.sigma, t.sigma), horizM) * 1000;
+          return row;
+        });
+      }
+      for (const r of site.refs || []) {
+        if (validPoint(r) && r.allFixed === false) out.warnings.push(`${r.name}: not every averaged epoch was RTK FIXED - lower accuracy`);
+      }
+    }
+
     for (const id of ids) {
       const p = out.poles[id];
       if (!p) continue;
@@ -171,8 +209,11 @@
     return out;
   }
 
-  // --- cameras.*.yaml: read values, and write them exactly the way
-  //     Ground_EO_Tracker/tools/gnss/survey.py does (comments/format kept) ---
+  // --- cameras.*.yaml. The survey fields are single `key: number` lines,
+  //     edited in place (comments, formatting and line count kept):
+  //       local_frame: origin_lat_deg / origin_lon_deg / origin_alt_m
+  //       <camera>: origin_e / origin_n / origin_u   (u = camera height above the origin)
+  //       ros__parameters: pole_distance_m           (0 = use the surveyed positions) ---
 
   const reEsc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
@@ -245,7 +286,7 @@
   }
 
   /** Writes the origin, each pole's origin_e/n/u and pole_distance_m: 0.0
-   * into a cameras.*.yaml text - the same edits as survey.py point --write. */
+   * into a cameras.*.yaml text. Nothing else in the file changes. */
   function applyToConfig(text, analysis, origin) {
     if (!validPoint(origin)) throw new Error("survey (or enter) the origin first");
     let t = text;
@@ -265,6 +306,18 @@
       try { t = replaceBlockScalar(t, "ros__parameters", "pole_distance_m", "0.0"); } catch (e) { /* not in this file */ }
     }
     return { text: t, written };
+  }
+
+  /** Lines that differ between two versions of the file (same line count). */
+  function configChanges(before, after) {
+    const a = splitLines(before), b = splitLines(after), out = [];
+    for (let i = 0; i < Math.max(a.length, b.length); i++) {
+      if (a[i] !== b[i]) {
+        const key = /^\s*([\w-]+):/.exec(b[i] || a[i] || "");
+        out.push({ line: i + 1, key: key ? key[1] : "", before: (a[i] ?? "").trim(), after: (b[i] ?? "").trim() });
+      }
+    }
+    return out;
   }
 
   /** Paste-able values when no config file is at hand. */
@@ -303,7 +356,7 @@
 
   const SiteCalc = {
     inverse, sight, plannedPoles, analyzeSite, vectorText, wrap180, norm360,
-    replaceBlockScalar, readBlockScalar, parseConfig, applyToConfig, configSnippet, pointsFromConfig,
+    replaceBlockScalar, readBlockScalar, parseConfig, applyToConfig, configChanges, configSnippet, pointsFromConfig,
   };
   if (typeof module !== "undefined") module.exports = SiteCalc;
   if (typeof window !== "undefined") window.SiteCalc = SiteCalc;
