@@ -286,11 +286,16 @@ async function main() {
   };
   const an = SiteCalc.analyzeSite(site);
   const pairText = s$("pairOut").textContent;
-  assert.ok(pairText.includes(`${an.pair.horizM.toFixed(3)} m`), `distance ${an.pair.horizM.toFixed(3)} not shown:\n${pairText}`);
-  assert.ok(pairText.includes(`${an.pair.trueBearingAB.toFixed(3)}°`), "bearing A->B shown");
+  const shownDist = Number(/Ground distance\s*([\d.]+) m/.exec(pairText)[1]);
+  const shownBear = Number(/Bearing camera_a → camera_b\s*([\d.]+)°/.exec(pairText)[1]);
+  assert.ok(Math.abs(shownDist - an.pair.horizM) < 1.5e-3, `distance shown ${shownDist} vs ${an.pair.horizM}`);
+  assert.ok(Math.abs(shownBear - an.pair.trueBearingAB) < 2e-3, `bearing shown ${shownBear} vs ${an.pair.trueBearingAB}`);
   const truthDist = Math.hypot(40 - wantE, -5 - 2);
   assert.ok(Math.abs(an.pair.horizM - truthDist) < 0.03, `pole distance ${an.pair.horizM} vs truth ~${truthDist}`);
-  assert.ok(pairText.includes(an.poles.camera_b.enu[0].toFixed(4)), "camera_b origin_e in the table");
+  // the table row "camera_b  e  n  u ..." (page keeps 0.1 mm, so compare numerically)
+  const row = [...s$("pairOut").querySelectorAll("tr")].map((tr) => [...tr.children].map((td) => td.textContent)).find((r) => r[0] === "camera_b");
+  assert.ok(row, "camera_b row in the table");
+  row.slice(1, 4).map(Number).forEach((v, i) => assert.ok(Math.abs(v - an.poles.camera_b.enu[i]) < 1e-3, `camera_b origin_e/n/u ${row} vs ${an.poles.camera_b.enu}`));
   assert.equal(s$("plot").querySelectorAll("circle").length, 3, "site plot draws origin + 2 poles");
   log(`Site map: ${an.pair.horizM.toFixed(3)} m at ${an.pair.trueBearingAB.toFixed(3)}° between the poles (truth ~${truthDist.toFixed(3)} m)`);
 
