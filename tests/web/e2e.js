@@ -10,7 +10,8 @@ const { spawn } = require("node:child_process");
 const net = require("node:net");
 const path = require("node:path");
 const assert = require("node:assert/strict");
-const { JSDOM } = require("jsdom");
+const { JSDOM, ResourceLoader } = require("jsdom");
+const SiteCalc = require("../../web/sitecalc.js");
 const { F9pSim, MockSerialPort, MockSerial } = require("./f9p_sim.js");
 
 const ROOT = path.resolve(__dirname, "..", "..");
@@ -40,14 +41,23 @@ async function startRelay(port) {
 
 function stopRelay(r) { return new Promise((res) => { r.proc.once("exit", res); r.proc.kill("SIGTERM"); }); }
 
-async function loadPage(pageUrl) {
+// Only the page's own files load; CDN scripts (Leaflet on the Site map) are
+// blocked, which also exercises the page's offline fallback.
+class SameOriginLoader extends ResourceLoader {
+  constructor(origin) { super(); this.origin = origin; }
+  fetch(url, options) { return url.startsWith(this.origin) ? super.fetch(url, options) : null; }
+}
+
+async function loadPage(pageUrl, opts = {}) {
   const serial = new MockSerial();
   const dom = await JSDOM.fromURL(pageUrl, {
     runScripts: "dangerously",
-    resources: "usable",
+    resources: new SameOriginLoader(new URL(pageUrl).origin),
     pretendToBeVisual: true,
     beforeParse(win) {
       Object.defineProperty(win.navigator, "serial", { value: serial, configurable: true });
+      win.BroadcastChannel = BroadcastChannel; // Node's: shared by every page in this process, like tabs of one browser
+      for (const [k, v] of Object.entries(opts.storage || {})) win.localStorage.setItem(k, v);
       win.fetch = (u, o = {}) => fetch(u, { ...o, signal: undefined });
       win.console.error = (...a) => console.error("  [page error]", ...a);
     },
@@ -246,6 +256,83 @@ async function main() {
   assert.ok(Math.abs(n - 2) < 0.02, `north ${n}`);
   assert.ok(Math.abs(u - 0.5) < 0.02, `up ${u}`);
   log(`camera_a offset from origin: e=${e} n=${n} u=${u} (truth e=${wantE.toFixed(4)} n~2 u=0.5)`);
+
+  // ---- survey camera_b, then the Site map page uses all three ----
+  const liveSeen = [];
+  const listener = new BroadcastChannel("gnss-live");
+  listener.onmessage = (ev) => liveSeen.push(ev.data);
+  const bLat = 17.3850123 - 5 / 110574, bLon = 78.4867456 + 40 / (111320 * Math.cos(17.3850123 * Math.PI / 180));
+  roverSim.moveTo(bLat, bLon, 541.3);
+  p.$("usbLabel").value = "camera_b";
+  p.$("usbStart").click();
+  await waitFor(p, () => /DONE "camera_b"/.test(text(p, "usbStatus")) || /ERROR/.test(text(p, "usbStatus")), 30000, "camera_b survey");
+  assert.match(text(p, "usbResult"), /saved as "camera_b" for the Site map/);
+  const saved = JSON.parse(p.win.localStorage.getItem("gnss_survey_results"));
+  assert.deepEqual(Object.keys(saved).sort(), ["camera_a", "camera_b", "origin"]);
+  for (const k of Object.keys(saved)) assert.equal(saved[k].all_fixed, true, k);
+  assert.ok(Math.abs(saved.camera_b.lat_deg - bLat) < 2e-7 && Math.abs(saved.camera_b.lon_deg - bLon) < 2e-7, "camera_b saved position");
+  assert.ok(liveSeen.length > 0 && liveSeen.every((m) => m.type === "pvt" && Number.isFinite(m.lat)), "console broadcasts live fixes");
+  log(`console saved origin/camera_a/camera_b for the Site map and broadcast ${liveSeen.length} live fixes`);
+
+  const sitePage = await loadPage(new URL("site.html", pageUrl).href, { storage: { gnss_survey_results: JSON.stringify(saved) } });
+  const s$ = sitePage.$;
+  assert.match(s$("mapNote").textContent, /didn't load/, "no Leaflet -> fallback note, page still works");
+  assert.match(s$("surveyNote").textContent, /origin .*camera_a .*camera_b/);
+  s$("loadSurvey").click();
+  const site = {
+    origin: { lat: saved.origin.lat_deg, lon: saved.origin.lon_deg, h: saved.origin.height_msl_m },
+    poles: Object.fromEntries(["camera_a", "camera_b"].map((k) => [k, { lat: saved[k].lat_deg, lon: saved[k].lon_deg, h: saved[k].height_msl_m, mount: 0 }])),
+    plan: null, declinationDeg: null,
+  };
+  const an = SiteCalc.analyzeSite(site);
+  const pairText = s$("pairOut").textContent;
+  assert.ok(pairText.includes(`${an.pair.horizM.toFixed(3)} m`), `distance ${an.pair.horizM.toFixed(3)} not shown:\n${pairText}`);
+  assert.ok(pairText.includes(`${an.pair.trueBearingAB.toFixed(3)}°`), "bearing A->B shown");
+  const truthDist = Math.hypot(40 - wantE, -5 - 2);
+  assert.ok(Math.abs(an.pair.horizM - truthDist) < 0.03, `pole distance ${an.pair.horizM} vs truth ~${truthDist}`);
+  assert.ok(pairText.includes(an.poles.camera_b.enu[0].toFixed(4)), "camera_b origin_e in the table");
+  assert.equal(s$("plot").querySelectorAll("circle").length, 3, "site plot draws origin + 2 poles");
+  log(`Site map: ${an.pair.horizM.toFixed(3)} m at ${an.pair.trueBearingAB.toFixed(3)}° between the poles (truth ~${truthDist.toFixed(3)} m)`);
+
+  // plan + corrections
+  s$("planDist").value = "37.5"; s$("planDist").dispatchEvent(new sitePage.win.Event("input"));
+  s$("planBearing").value = "100"; s$("planBearing").dispatchEvent(new sitePage.win.Event("input"));
+  assert.match(s$("planOut").textContent, /move camera_a: \d+\.\d{3} m towards/);
+  assert.match(s$("planOut").textContent, /Distance vs plan/);
+  log("plan entered -> per-pole corrections shown");
+
+  // live rover from the console tab, directions to camera_b (where the rover sits)
+  p.$("usbMonitor").click();
+  s$("target").value = "pole:camera_b"; s$("target").dispatchEvent(new sitePage.win.Event("change"));
+  await waitFor(sitePage, () => /FIX=true/.test(s$("liveOut").textContent) && /camera_b \(surveyed\):/.test(s$("liveOut").textContent), 15000, "live rover on the Site map");
+  const liveText = s$("liveOut").textContent;
+  const off = /camera_b \(surveyed\): (in place|(\d+\.\d+) m)/.exec(liveText);
+  assert.ok(off && (off[1] === "in place (< 1 mm)" || Number(off[2]) < 0.02), `rover at camera_b should be ~0 m away:\n${liveText}`);
+  log("live rover from the console tab -> " + liveText.split("\n").find((l) => /camera_b/.test(l)));
+  p.$("usbStop").click();
+  await waitFor(p, () => /monitor stopped/.test(text(p, "usbStatus")) && !p.$("usbStart").disabled, 10000, "monitor stops");
+  listener.close();
+
+  // write into a config file
+  const yaml = "ground_tracker_node:\n  ros__parameters:\n    local_frame:\n      origin_lat_deg: 0.0\n      origin_lon_deg: 0.0\n      origin_alt_m: 0.0\n" +
+    "    pole_distance_m: 50.0\n    camera_ids: [\"camera_a\", \"camera_b\"]\n    camera_a:\n      host: \"x\"\n      origin_e: 0.0\n      origin_n: 0.0\n      origin_u: 0.0   # m\n" +
+    "    camera_b:\n      origin_e: 0.0\n      origin_n: 0.0\n      origin_u: 0.0\n";
+  s$("cfgIn").value = yaml;
+  s$("cfgWrite").click();
+  const outYaml = s$("cfgOut").value;
+  // same values as computing directly from the saved results (the page keeps 0.1 mm)
+  const got = SiteCalc.parseConfig(outYaml);
+  assert.equal(got.poleDistanceM, 0);
+  assert.ok(Math.abs(got.origin.lat - site.origin.lat) < 1e-8 && Math.abs(got.origin.lon - site.origin.lon) < 1e-8 && Math.abs(got.origin.h - site.origin.h) < 1e-3);
+  for (const id of ["camera_a", "camera_b"]) {
+    const c = got.cameras[id], want = an.poles[id].enu;
+    assert.ok(Math.abs(c.e - want[0]) < 1e-3 && Math.abs(c.n - want[1]) < 1e-3 && Math.abs(c.u - want[2]) < 1e-3, `${id}: ${JSON.stringify(c)} vs ${want}`);
+  }
+  assert.match(outYaml, /camera_a:\n      host: "x"\n      origin_e: [-\d.]+\n/, "unrelated lines untouched");
+  assert.match(outYaml, /origin_u: [-\d.]+  # m\n/, "comments kept");
+  log("Site map wrote origin + both poles + pole_distance_m: 0.0 into a pasted config");
+  sitePage.win.eval("liveChannel.close()"); // Node's BroadcastChannel outlives a closed jsdom window; a browser tab's doesn't
+  sitePage.win.close();
 
   // ---- FLOAT-only conditions ----
   roverSim.o.maxCarr = 1;

@@ -193,6 +193,25 @@ function diagnoseNoFix(framesSeen, bestCarr, link, channel, requireFixed) {
     (requireFixed ? ", or untick FIXED-only to accept FLOAT." : ".");
 }
 
+// Shared with the Site map page (site.html) in this browser: finished point
+// results are kept per label, and the rover's live fix is broadcast to it.
+const RESULTS_KEY = "gnss_survey_results";
+const liveChannel = "BroadcastChannel" in window ? new BroadcastChannel("gnss-live") : null;
+
+function saveSurveyResult(r) {
+  try {
+    const all = JSON.parse(localStorage.getItem(RESULTS_KEY) || "{}");
+    all[r.label] = { lat_deg: r.lat_deg, lon_deg: r.lon_deg, height_msl_m: r.height_msl_m, n: r.n, spread_m: r.spread_m, all_fixed: r.all_fixed, at: new Date().toISOString() };
+    localStorage.setItem(RESULTS_KEY, JSON.stringify(all));
+    return true;
+  } catch (e) { return false; } // private mode: the result is still on screen
+}
+
+function shareLive(pvt) {
+  if (!liveChannel || !pvt || pvt.fixType < 2) return;
+  liveChannel.postMessage({ type: "pvt", lat: pvt.latDeg, lon: pvt.lonDeg, h: pvt.heightMslM, carrSoln: pvt.carrSoln, hAccM: pvt.hAccM, numSv: pvt.numSv, at: Date.now() });
+}
+
 function renderPointResult(el, r) {
   if (r.cancelled) { el.innerHTML = "<i>cancelled</i>"; return; }
   let text = `label: ${r.label}\nlat: ${r.lat_deg.toFixed(9)}\nlon: ${r.lon_deg.toFixed(9)}\n` +
@@ -204,6 +223,16 @@ function renderPointResult(el, r) {
   const code = document.createElement("code");
   code.textContent = text;
   el.replaceChildren(code);
+  if (saveSurveyResult(r)) {
+    const note = document.createElement("small");
+    note.className = "hint";
+    note.append(`saved as "${r.label}" for the `);
+    const a = document.createElement("a");
+    a.href = "site.html"; a.target = "_blank"; a.textContent = "Site map";
+    a.style.color = "var(--accent)";
+    note.append(a, " (distance and bearing between the poles)");
+    el.append(note);
+  }
   if (r.label === "origin") {
     $("originLat").value = r.lat_deg.toFixed(9);
     $("originLon").value = r.lon_deg.toFixed(9);
@@ -281,6 +310,7 @@ async function usbRunSession(mode) {
         if (!conn.alive) throw new Error("USB receiver disconnected");
         setStatus("usb", roverBlock(conn, usbLink, channel, pvt, "LIVE MONITOR (nothing recorded)", warn));
         fixBadge("usb", pvt);
+        shareLive(pvt);
       }
       setStatus("usb", roverBlock(conn, usbLink, channel, conn.latestPvt(), "monitor stopped", warn));
     } else {
@@ -297,6 +327,7 @@ async function usbRunSession(mode) {
           (requireFixed ? " (RTK FIXED only)" : " (RTK FIXED or FLOAT)");
         setStatus("usb", roverBlock(conn, usbLink, channel, pvt, head, warn));
         fixBadge("usb", pvt);
+        shareLive(pvt);
         if (!pvt) continue;
         framesSeen++;
         if (pvt.carrSoln > bestCarr) bestCarr = pvt.carrSoln;
