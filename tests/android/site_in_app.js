@@ -93,11 +93,12 @@ const prefsXml = (entries) => `<?xml version='1.0' encoding='utf-8' standalone='
 
 async function main() {
   assert.match(adb("devices"), /\tdevice\b/, "no booted device/emulator for adb");
+  const external = argVal("--relay");           // e.g. https://gnss-relay.onrender.com
   const port = await freePort();
-  const relay = spawn("python3", [path.join(ROOT, "server/app.py"), "--host", "127.0.0.1", "--port", String(port)], { stdio: "ignore" });
-  const relayHost = `http://127.0.0.1:${port}`;
-  adb("reverse", `tcp:${port}`, `tcp:${port}`); // the device reaches this relay as its own 127.0.0.1
-  const relayApp = `127.0.0.1:${port}`;          // typed form: the app/page normalize it to http://
+  const relay = external ? null : spawn("python3", [path.join(ROOT, "server/app.py"), "--host", "127.0.0.1", "--port", String(port)], { stdio: "ignore" });
+  const relayHost = external || `http://127.0.0.1:${port}`;
+  if (!external) adb("reverse", `tcp:${port}`, `tcp:${port}`); // the device reaches this relay as its own 127.0.0.1
+  const relayApp = external || `127.0.0.1:${port}`;             // typed form: the app/page normalize it to http://
   const CH = "app-" + Math.random().toString(36).slice(2, 8);
   let fwd = null;
   try {
@@ -123,7 +124,7 @@ async function main() {
     const tmpl = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "site-app-")), "cameras.local.yaml");
     fs.writeFileSync(tmpl, y.template); // the committed template only - never a real cameras.local.yaml
     adb("push", tmpl, "/sdcard/Download/cameras.local.yaml");
-    log(`installed ${path.basename(APK)}; relay ${relayHost} (adb reverse), channel ${CH}; template pushed to Download/`);
+    log(`installed ${path.basename(APK)}; relay ${relayHost}${external ? "" : " (adb reverse)"}, channel ${CH}; template pushed to Download/`);
 
     adb("shell", "am", "start", "-W", "-n", `${PKG}/.MainActivity`);
     await tapText(/^Site map$/);
@@ -147,7 +148,7 @@ async function main() {
     log(`app Site map: relay settings + channel from the app, web-console results shown (${an.pair.horizM.toFixed(3)} m), the app's own result shown and uploaded`);
 
     // a rover elsewhere: its live fix reaches the app's Site map through the relay
-    const rover = new WebSocket(`ws://127.0.0.1:${port}/ws/relay/${CH}?role=rover`);
+    const rover = new WebSocket(`${relayHost.replace(/^http/, "ws")}/ws/relay/${CH}?role=rover`);
     await new Promise((r) => rover.once("open", r));
     rover.send(JSON.stringify({ type: "pvt", lat: y.poles.camera_b[0], lon: y.poles.camera_b[1], h: y.poles.camera_b[2], carrSoln: 2, hAccM: 0.01, numSv: 21, source: "laptop rover" }));
     await page.eval("const t = document.getElementById('target'); t.value = 'pole:camera_b'; t.dispatchEvent(new Event('change')); 1");
@@ -195,8 +196,8 @@ async function main() {
     console.log("\nALL IN-APP SITE MAP CHECKS PASSED");
   } finally {
     if (fwd) try { adb("forward", "--remove", `tcp:${fwd}`); } catch (e) { /* gone */ }
-    try { adb("reverse", "--remove", `tcp:${port}`); } catch (e) { /* gone */ }
-    relay.kill();
+    if (!external) try { adb("reverse", "--remove", `tcp:${port}`); } catch (e) { /* gone */ }
+    if (relay) relay.kill();
   }
 }
 
