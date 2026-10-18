@@ -80,6 +80,30 @@ internet; without it the exact plot and every number still work.
 - **No sign-in:** anyone who knows a channel name can read it, so use a
   non-obvious channel for a real site.
 
+### Clearing results
+
+Anything that deletes or replaces a result asks first, in a warning box
+that says what goes and where.
+
+- **Survey console / app Survey tab:** the Rover panel lists what is saved
+  on its channel. **Clear results...** -> **Delete everywhere** deletes them
+  from this device, the relay and every device on the channel (each drops
+  them at its next sync, within a minute); **Keep them stored** changes
+  nothing.
+- **Site map -> Clear...:**
+  - **Clear this page, keep the results stored** - the points leave this
+    page only. The results stay on every device and the relay, new ones
+    still arrive, and **Load survey results** brings them back.
+  - **Delete the results everywhere** - as in the console.
+- **A clear sticks.** The relay refuses older copies from devices that
+  missed it, and a device that comes back online drops everything from
+  before it, including points it surveyed offline. Points surveyed after
+  the clear are kept. What was typed by hand in a Site map on another
+  device stays there.
+- **Also asked first:** surveying a label that already has a result
+  (replaces it everywhere), removing a surveyed reference point (deletes it
+  everywhere), and **Load survey results** over points edited by hand.
+
 ## Status lines
 
 Every connected panel in the console shows live stats, for example the rover:
@@ -108,8 +132,9 @@ push to `main`. GitHub Pages serves `web/` (`.github/workflows/pages.yml`).
 |---|---|
 | `GET /healthz` | liveness + version |
 | `GET /status/{channel}` | base online?, bases/rovers/watchers, bytes, age of last base data, results |
-| `GET /results/{channel}` | the channel's survey results |
-| `PUT /results/{channel}/{label}` | store one (kept only if newer) |
+| `GET /results/{channel}` | the channel's survey results, and when it was last cleared |
+| `PUT /results/{channel}/{label}` | store one (kept only if newer, and newer than the last clear) |
+| `DELETE /results/{channel}?at=...&source=...` | clear the channel up to `at` (newest clear wins) |
 | `WS /ws/relay/{channel}?role=base\|rover\|watch` | base -> rovers (RTCM); rover -> watchers (live fix, JSON) |
 
 - **Waking up:** it sleeps after ~15 min idle and takes 30-60 s to wake; the
@@ -147,12 +172,12 @@ Checked against independent implementations, not against itself:
 | `tests/oracle/` | UBX/RTCM vectors from **pyubx2/pyrtcm**; our encoded frames parsed back by pyubx2 |
 | `tests/web/protocol.test.js` | `web/gnss.js` against those vectors, plus recovery from noise and false sync |
 | `tests/web/f9p_sim.js` | an F9P simulator written from the spec (itself verified by pyubx2) |
-| `tests/web/e2e.js` | the real page + relay with simulated receivers: auto-baud, survey-in -> broadcast -> RTK FIXED, origin and pole accuracy, Site map, live rover, config writing, faults (buffer overrun, relay restart, unplugging) |
+| `tests/web/e2e.js` | the real page + relay with simulated receivers: auto-baud, survey-in -> broadcast -> RTK FIXED, origin and pole accuracy, Site map, live rover, config writing, clearing (keep stored / delete everywhere, seen on another device) and its warning boxes, faults (buffer overrun, relay restart, unplugging) |
 | `tests/web/sitecalc.test.js` | Site map math against **geographiclib** and **PROJ**, and against Ground_EO_Tracker's `geolocation.py` / `site_layout.py` |
 | `tests/oracle/check_site_config.py` | a config written by the Site map, read with the tracker's own code: origin, `camera_origins()`, every other setting unchanged, boresight az/el |
-| `tests/web/site_browser.js` | the Site map in real headless Chrome: map, two tabs, Open -> Write -> Save |
-| `tests/server/test_relay.py` | relay fan-out, status, two bases, isolation, stalled rover, results (newest wins, deletions, validation), live fixes to watchers (also against the live URL) |
-| `android/app/src/test/` | the app's protocol, session and result-sync code against the same vectors and a real relay |
+| `tests/web/site_browser.js` | the Site map in real headless Chrome: map, two tabs, Open -> Write -> Save, warning boxes (keyboard, phone width), a clear reaching the other tab and the app bridge |
+| `tests/server/test_relay.py` | relay fan-out, status, two bases, isolation, stalled rover, results (newest wins, deletions, clearing, validation), live fixes to watchers (also against the live URL) |
+| `android/app/src/test/` | the app's protocol, session, result-sync and clearing code against the same vectors and a real relay |
 | `tests/android/site_in_app.js` | the installed app on a device/emulator: the Site map tab's WebView and bridge, results from the relay and from the app, live fix, and Open/Save through Android's file picker on a real file |
 
 The checks against Ground_EO_Tracker run when it's checked out next to this
@@ -169,6 +194,7 @@ field test.
 | `web/gnss.js`, `webserial.js` | UBX/RTCM3 protocol; Web Serial connection + relay client |
 | `web/wgs84.js`, `sitecalc.js` | WGS84 <-> ENU; site geometry and `cameras.yaml` read/write |
 | `web/results.js` | survey results shared through the relay |
+| `web/dialog.js` | warning boxes before anything is deleted or replaced |
 | `server/app.py` | the relay (+ serves `web/`) |
 | `android/` | the native app |
 | `tests/` | see Testing |

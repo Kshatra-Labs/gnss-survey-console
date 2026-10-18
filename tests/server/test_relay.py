@@ -38,6 +38,15 @@ def put_json(base: str, path: str, body) -> tuple[int, dict]:
         return e.code, {}
 
 
+def delete_json(base: str, path: str) -> tuple[int, dict]:
+    req = urllib.request.Request(base + path, method="DELETE")
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            return r.status, json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        return e.code, {}
+
+
 def ws_url(base: str, channel: str, role: str) -> str:
     return base.replace("http", "ws", 1) + f"/ws/relay/{channel}?role={role}"
 
@@ -156,6 +165,43 @@ async def run(base: str, local: bool) -> None:
     assert get_json(base, f"/results/{rc}")["results"]["origin"]["deleted"] is True
     assert get_json(base, f"/status/{rc}")["results"] == 0
     print("ok  results: deletion marker wins over older re-uploads")
+
+    # ---- clearing a channel: what it covers goes, older copies uploaded later are refused ----
+    cc = "c-" + uuid.uuid4().hex[:8]
+    assert get_json(base, f"/results/{cc}")["cleared"] is None
+    a = {**res, "at": "2026-10-13T10:00:00Z"}
+    assert put_json(base, f"/results/{cc}/origin", a)[1]["stored"] is True
+    assert put_json(base, f"/results/{cc}/camera_a", {**a, "at": "2026-10-13T10:01:00Z"})[1]["stored"] is True
+    clear = {"at": "2026-10-13T10:05:00Z", "source": "test"}
+    async with websockets.connect(ws_url(base, cc, "watch")) as w:
+        await asyncio.sleep(0.3)
+        code, body = await asyncio.to_thread(delete_json, base, f"/results/{cc}?at={clear['at']}&source=test")
+        assert (code, body) == (200, {"cleared": True, "marker": clear}), (code, body)
+        got = json.loads(await asyncio.wait_for(w.recv(), 10))
+        assert got == {"type": "cleared", "cleared": clear}, got
+    got = get_json(base, f"/results/{cc}")
+    assert got["cleared"] == clear, got
+    assert got["results"] == {"origin": {"deleted": True, **clear}, "camera_a": {"deleted": True, **clear}}, got
+    assert get_json(base, f"/status/{cc}")["results"] == 0
+    print("ok  clear: every result it covers becomes a deletion marker; watchers told; status counts 0")
+
+    assert put_json(base, f"/results/{cc}/origin", a)[1]["stored"] is False, "a device that missed the clear re-uploads"
+    assert put_json(base, f"/results/{cc}/mast", {**a, "at": "2026-10-13T10:04:59Z"})[1]["stored"] is False, "a label the clear never saw"
+    assert "mast" not in get_json(base, f"/results/{cc}")["results"]
+    after = {**a, "at": "2026-10-13T10:06:00Z"}
+    assert put_json(base, f"/results/{cc}/origin", after)[1]["stored"] is True
+    print("ok  clear: older copies refused (even of labels it never saw); results surveyed after it stored")
+
+    code, body = delete_json(base, f"/results/{cc}?at=2026-10-13T10:00:30Z&source=old")
+    assert code == 200 and body["cleared"] is False and body["marker"] == clear, body
+    assert get_json(base, f"/results/{cc}")["results"]["origin"] == after
+    assert delete_json(base, f"/results/{cc}?at=2026-10-13T10:07:00%2B00:00")[1]["cleared"] is True
+    assert get_json(base, f"/results/{cc}")["results"]["origin"]["deleted"] is True
+    print("ok  clear: an older clear changes nothing; a newer one covers what came since")
+
+    for bad in ["?at=yesterday", "?at=2026-10-13T10:00:00", "", "?at=2026-10-13T11:00:00Z&source=" + "x" * 61]:
+        assert delete_json(base, f"/results/{cc}{bad}")[0] == 422, bad
+    print("ok  clear: missing / malformed / zoneless time and an over-long source refused (422)")
 
     for bad_label, bad_body in [("bad label!", res), ("x" * 41, res), ("p", {**res, "lat_deg": 91}),
                                 ("p", {**res, "lat_deg": "12"}), ("p", {**res, "at": "yesterday"}),

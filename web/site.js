@@ -20,7 +20,8 @@ const store = {
 const blankPoint = () => ({ lat: "", lon: "", h: "", mount: "", src: "" });
 
 // The current site's points/refs/plan are on `state`; other channels' are kept in state.sites.
-let state = Object.assign({ ids: ["camera_a", "camera_b"], points: {}, refs: [], plan: { dist: "", bearing: "" }, decl: "", view: "map", channel: "", sites: {} },
+// hideBefore: results up to this time were cleared from the page but are still stored.
+let state = Object.assign({ ids: ["camera_a", "camera_b"], points: {}, refs: [], plan: { dist: "", bearing: "" }, decl: "", view: "map", channel: "", sites: {}, hideBefore: "" },
   store.get(STATE_KEY) || {});
 const startChannel = (A && A.channel()) || state.channel ||
   (() => { try { return localStorage.getItem("gnss_last_channel"); } catch (e) { return null; } })() || "default";
@@ -102,10 +103,28 @@ function refCard(r, i) {
   name.value = r.name;
   name.addEventListener("input", () => { r.name = name.value; save(); update(); });
   const del = el("button", { class: "secondary", title: "remove" }, "remove");
-  del.onclick = () => {
-    state.refs.splice(i, 1);
-    if (r.at && Results.LABEL_RE.test(r.name)) { // a surveyed one: remove it everywhere, or the next sync brings it back
+  del.onclick = async () => {
+    const surveyed = r.at && Results.LABEL_RE.test(r.name);
+    if (surveyed || r.lat || r.lon || r.h) {
+      const choice = await warningBox(surveyed ? {
+        title: `Remove "${r.name}" everywhere?`,
+        body: [r.src, `It was surveyed, so it is deleted from the relay and every device on channel "${state.channel}". This can't be undone.`],
+        choices: [{ value: "remove", label: "Remove everywhere", danger: true }],
+        cancel: "Keep it",
+      } : {
+        title: `Remove "${r.name || "reference point"}"?`,
+        body: "Its values were typed on this page and aren't stored anywhere else.",
+        choices: [{ value: "remove", label: "Remove", danger: true }],
+        cancel: "Keep it",
+      });
+      if (choice !== "remove") return;
+    }
+    const pos = state.refs.indexOf(r); // the list may have changed while asking
+    if (pos < 0) return;
+    state.refs.splice(pos, 1);
+    if (surveyed) { // a surveyed one: remove it everywhere, or the next sync brings it back
       results = Results.merge(results, { [r.name]: Results.record(state.channel, r.name, { deleted: true }, A ? "Android app" : "site map") }).results;
+      toApp();
       syncNow();
     }
     save(); buildForms(); update();
@@ -133,6 +152,9 @@ let sync = { at: 0, error: null, reachable: null, live: false };
 
 const isHandEdited = (p) => /(edited\)|by hand)$|^from /.test(p.src || "");
 const newerThan = (r, p) => !p.at || Date.parse(r.at) > Date.parse(p.at);
+const notAfter = (p, t) => !!(t && p.at && Date.parse(p.at) <= Date.parse(t));
+/** Inside the app: hands the page's view of the channel to the app's own copy (newest wins). */
+const toApp = () => { if (A && A.mergeResults) A.mergeResults(state.channel, JSON.stringify(results)); };
 
 function fromSurvey(r) {
   return {
@@ -143,16 +165,24 @@ function fromSurvey(r) {
 }
 
 /** Puts results into the points: new labels always; newer results only into
- * points not edited by hand - unless forced ("Load survey results"). */
+ * points not edited by hand - unless forced ("Load survey results"). A
+ * surveyed point whose result was deleted or cleared goes (if edited by hand,
+ * only when forced). Results cleared from this page only stay out unless forced. */
 function applyResults(force) {
   let changed = false;
-  for (const [label, r] of Object.entries(results)) {
+  if (force && state.hideBefore) { state.hideBefore = ""; changed = true; }
+  const cleared = results[Results.CLEARED];
+  const gone = (p, r) => !!p.at && (force || !isHandEdited(p)) && (notAfter(p, cleared && cleared.at) || (!!r && r.deleted && newerThan(r, p)));
+  for (const l of labels()) {
+    const p = state.points[l];
+    if (gone(p, results[l])) { state.points[l] = Object.assign(blankPoint(), { mount: p.mount }); changed = true; }
+  }
+  const kept = state.refs.filter((x) => !gone(x, results[x.name]));
+  if (kept.length !== state.refs.length) { state.refs = kept; changed = true; }
+  for (const label of Results.labels(results)) {
+    const r = results[label];
+    if (!force && notAfter(r, state.hideBefore)) continue;
     const isMain = labels().includes(label);
-    if (r.deleted) {
-      const i = state.refs.findIndex((x) => x.name === label);
-      if (i >= 0 && (force || !isHandEdited(state.refs[i])) && newerThan(r, state.refs[i])) { state.refs.splice(i, 1); changed = true; }
-      continue;
-    }
     let p = isMain ? state.points[label] : state.refs.find((x) => x.name === label);
     if (!p) state.refs.push(p = { name: label, above: "" });
     if (force || ((!p.lat || !isHandEdited(p)) && newerThan(r, p))) { Object.assign(p, fromSurvey(r)); changed = true; }
@@ -162,8 +192,11 @@ function applyResults(force) {
 }
 
 function renderSyncNote() {
-  const names = Object.keys(results).filter((k) => !results[k].deleted);
-  const parts = [names.length ? `${names.length} result(s): ${names.join(", ")}` : "no results on this channel yet"];
+  const names = Results.labels(results), c = results[Results.CLEARED];
+  const hidden = names.filter((l) => notAfter(results[l], state.hideBefore)).length;
+  const parts = [names.length ? `${names.length} result(s): ${names.join(", ")}`
+    : c ? `results cleared ${new Date(c.at).toLocaleString()}${c.source ? ` (${c.source})` : ""}` : "no results on this channel yet"];
+  if (hidden) parts.push(`${hidden} kept stored but cleared from this page (Load survey results shows them)`);
   if (sync.reachable === false) parts.push(`relay unreachable (${sync.error}) - showing what this device has`);
   else if (sync.at) parts.push(`synced ${new Date(sync.at).toLocaleTimeString()}${sync.error ? ` (${sync.error})` : ""}`);
   else parts.push("syncing with the relay...");
@@ -183,28 +216,32 @@ async function syncNow() {
   renderSyncNote();
 }
 
+/** A result or clear pushed by the relay. */
+function mergeIn(from) {
+  const m = Results.merge(results, from);
+  if (!m.changed.length) return;
+  results = m.results;
+  Results.saveLocal(state.channel, results);
+  applyResults(false);
+  renderSyncNote();
+}
+
 let watch = null;
 function startWatch() {
   if (watch) watch.stop();
   sync.live = false;
   watch = window.startRelayWatch(relayUrl(), state.channel, (ev) => {
     if (ev.type === "pvt") setLive(ev);
-    else if (ev.type === "result" && Results.LABEL_RE.test(ev.label)) {
-      const m = Results.merge(results, { [ev.label]: ev.result });
-      if (!m.changed.length) return;
-      results = m.results;
-      Results.saveLocal(state.channel, results);
-      applyResults(false);
-      renderSyncNote();
-    }
+    else if (ev.type === "result" && Results.LABEL_RE.test(ev.label)) mergeIn({ [ev.label]: ev.result });
+    else if (ev.type === "cleared" && ev.cleared) mergeIn({ [Results.CLEARED]: ev.cleared });
   }, (up) => { sync.live = up; renderSyncNote(); });
 }
 
 function switchSite(ch) {
-  if (state.channel) state.sites[state.channel] = { ids: state.ids, points: state.points, refs: state.refs, plan: state.plan };
+  if (state.channel) state.sites[state.channel] = { ids: state.ids, points: state.points, refs: state.refs, plan: state.plan, hideBefore: state.hideBefore };
   const s = state.sites[ch] || {};
   delete state.sites[ch];
-  Object.assign(state, { channel: ch, ids: s.ids || ["camera_a", "camera_b"], points: s.points || {}, refs: s.refs || [], plan: s.plan || { dist: "", bearing: "" } });
+  Object.assign(state, { channel: ch, ids: s.ids || ["camera_a", "camera_b"], points: s.points || {}, refs: s.refs || [], plan: s.plan || { dist: "", bearing: "" }, hideBefore: s.hideBefore || "" });
   for (const l of labels()) state.points[l] = Object.assign(blankPoint(), state.points[l] || {});
   $("planDist").value = state.plan.dist; $("planBearing").value = state.plan.bearing;
   mapFitted = false;
@@ -233,6 +270,20 @@ setInterval(syncNow, 30000); // also keeps a free-tier relay awake while the pag
 
 $("loadSurvey").onclick = async () => {
   await syncNow();
+  // what forcing would overwrite or remove of what was typed here
+  const live = Results.labels(results), cleared = results[Results.CLEARED];
+  const edits = [...labels().map((l) => [l, state.points[l]]), ...state.refs.map((r) => [r.name, r])]
+    .filter(([name, p]) => p.lat && isHandEdited(p) && (live.includes(name) || notAfter(p, cleared && cleared.at) || (results[name] && results[name].deleted && p.at)))
+    .map(([name]) => name);
+  if (edits.length) {
+    const choice = await warningBox({
+      title: "Replace your edits with the survey results?",
+      body: `${edits.join(", ")} ${edits.length > 1 ? "were" : "was"} typed or edited by hand on this page. Loading the survey results replaces ${edits.length > 1 ? "them" : "it"} with what is stored on channel "${state.channel}".`,
+      choices: [{ value: "load", label: "Replace with the survey results", danger: true }],
+      cancel: "Keep my edits",
+    });
+    if (choice !== "load") return;
+  }
   applyResults(true);
 };
 
@@ -243,11 +294,34 @@ window.addEventListener("storage", (e) => {
   if (m.changed.length) { results = m.results; applyResults(false); renderSyncNote(); syncNow(); }
 });
 
-$("clearPoints").onclick = () => {
-  if (!confirm("Clear all points on this page? (Survey results stay on the relay and in the console; \"Load survey results\" brings them back.)")) return;
+$("clearPoints").onclick = async () => {
+  const ch = state.channel, names = Results.labels(results);
+  const choice = await warningBox(names.length ? {
+    title: `Clear the points on channel "${ch}"?`,
+    body: `${names.length} survey result(s) stored on this channel: ${names.join(", ")}.`,
+    choices: [
+      { value: "page", label: "Clear this page, keep the results stored",
+        note: "The points leave this page only. The results stay on this device and the relay, other devices keep them, and Load survey results brings them back here. New results still arrive." },
+      { value: "everywhere", label: "Delete the results everywhere", danger: true,
+        note: "Deletes them from the relay, this device and every device on this channel; each drops them at its next sync. This can't be undone." },
+    ],
+  } : {
+    title: "Clear the points on this page?",
+    body: `No survey results are stored on channel "${ch}", so this only empties what was typed here.`,
+    choices: [{ value: "page", label: "Clear this page", danger: true }],
+  });
+  if (!choice || ch !== state.channel) return;
+  if (choice === "everywhere") {
+    results = Results.merge(results, { [Results.CLEARED]: Results.clear(ch, A ? "Android app" : "site map", results) }).results;
+    toApp();
+    syncNow();
+  }
+  // what is stored now stays off this page (until Load survey results); what comes later shows
+  const latest = Math.max(0, ...Results.labels(results).map((l) => Date.parse(results[l].at) || 0));
+  state.hideBefore = latest ? new Date(latest).toISOString() : "";
   for (const l of labels()) state.points[l] = blankPoint();
   state.refs = [];
-  save(); buildForms(); update();
+  save(); buildForms(); update(); renderSyncNote();
 };
 
 $("addRef").onclick = () => {

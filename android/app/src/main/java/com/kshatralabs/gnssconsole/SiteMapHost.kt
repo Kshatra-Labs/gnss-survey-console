@@ -24,8 +24,8 @@ import org.json.JSONObject
 /** The Site map tab: web/site.html - bundled into the app's assets - in a
  * WebView, so the phone runs the very page (and math) the website does.
  * `window.AndroidSite` gives the page the app's relay address, channel and
- * its own results, and opens/saves cameras.local.yaml through Android's
- * file picker. Results and live fixes reach it through the relay as on any
+ * its own results (and takes back the page's clears and deletions), and
+ * opens/saves cameras.local.yaml through Android's file picker. Results and live fixes reach it through the relay as on any
  * device, and straight from this app's rover too. */
 class SiteMapHost(private val activity: ComponentActivity, private val vm: ConsoleViewModel) {
     private var configUri: Uri? = null
@@ -87,6 +87,8 @@ class SiteMapHost(private val activity: ComponentActivity, private val vm: Conso
         @JavascriptInterface fun relayUrl(): String = vm.backendUrl
         @JavascriptInterface fun channel(): String = vm.channel
         @JavascriptInterface fun results(channel: String): String = vm.results.load(channel).toString()
+        /** The page cleared the channel or removed a point: the app's copy takes it at once. */
+        @JavascriptInterface fun mergeResults(channel: String, json: String) = vm.adoptFromSite(channel, json)
         @JavascriptInterface fun openConfig() = activity.runOnUiThread { openDoc.launch(arrayOf("*/*")) }
         @JavascriptInterface fun saveConfig(text: String) {
             val uri = configUri ?: return js("siteAndroid.configSaved(false, ${q("open the file first")})")

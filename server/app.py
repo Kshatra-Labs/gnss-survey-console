@@ -8,16 +8,20 @@ browser (Web Serial) or the Android app. On a named channel (one per site):
   - a rover may send its live fix as JSON text; it goes to every "watch"
     connection (the Site map), wherever that is;
   - finished point results are stored per label, newest `at` wins, so the
-    Site map on any device sees what any console or app surveyed.
+    Site map on any device sees what any console or app surveyed;
+  - a channel can be cleared: everything surveyed up to the clear's `at` is
+    gone, and an older copy a device uploads later is refused.
 
-    GET  /healthz                      liveness + version
-    GET  /status/{channel}             base live?, rovers, watchers, results
-    GET  /results/{channel}            every stored result (and deletion marker)
-    PUT  /results/{channel}/{label}    store one (kept only if newer)
-    WS   /ws/relay/{channel}?role=base|rover|watch
+    GET    /healthz                         liveness + version
+    GET    /status/{channel}                base live?, rovers, watchers, results
+    GET    /results/{channel}               every stored result (and deletion marker), the clear
+    PUT    /results/{channel}/{label}       store one (kept only if newer)
+    DELETE /results/{channel}?at=&source=   clear the channel (newest clear wins)
+    WS     /ws/relay/{channel}?role=base|rover|watch
 
 Results live in memory: a free host that sleeps forgets them, so every
-client keeps its own copy and re-uploads it (newest-wins makes that safe).
+client keeps its own copy and re-uploads it (newest-wins makes that safe;
+the clear is re-uploaded the same way).
 
 Run with:  python3 server/app.py [--host 0.0.0.0] [--port 8765]
 """
@@ -37,7 +41,7 @@ from fastapi import Body, FastAPI, HTTPException, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
-VERSION = "4"
+VERSION = "5"
 SEND_TIMEOUT_S = 5.0
 IDLE_CHANNEL_TTL_S = 600.0
 MAX_RESULTS_PER_CHANNEL = 200
@@ -69,6 +73,7 @@ class Channel:
         self.last_base_data_at = 0.0
         self.last_activity = time.monotonic()
         self.results: dict[str, dict] = {}
+        self.cleared: dict | None = None  # {at, source}: results up to `at` are gone
         self.last_pvt: dict | None = None
         self.last_pvt_at = 0.0
 
@@ -79,12 +84,17 @@ _channels: dict[str, Channel] = {}
 def _channel(name: str) -> Channel:
     now = time.monotonic()
     for key in [k for k, c in _channels.items()
-                if not c.bases and not c.rovers and not c.watchers and not c.results
+                if not c.bases and not c.rovers and not c.watchers and not c.results and not c.cleared
                 and now - c.last_activity > IDLE_CHANNEL_TTL_S]:
         del _channels[key]
     chan = _channels.setdefault(name, Channel())
     chan.last_activity = now
     return chan
+
+
+def _room_for(channel: str) -> None:
+    if channel not in _channels and sum(1 for c in _channels.values() if c.results or c.cleared) >= MAX_CHANNELS_WITH_RESULTS:
+        raise HTTPException(507, "relay full")
 
 
 _background: set[asyncio.Task] = set()
@@ -165,6 +175,14 @@ def _clean_result(d: dict) -> dict:
     }
 
 
+def _clean_clear(at: str, source: str) -> dict:
+    d = {"at": at, "source": source}
+    _when(d)
+    if len(source) > 60:
+        raise ValueError("source must be a short string")
+    return d
+
+
 def _clean_pvt(d: dict) -> dict:
     out = {"type": "pvt", "lat": _num(d, "lat", -90, 90), "lon": _num(d, "lon", -180, 180),
            "h": _num(d, "h", -1000, 20000), "carrSoln": int(_num(d, "carrSoln", 0, 2)),
@@ -206,7 +224,7 @@ def status(channel: str) -> dict:
 @app.get("/results/{channel}")
 def get_results(channel: str) -> dict:
     chan = _channels.get(channel)
-    return {"channel": channel, "results": dict(chan.results) if chan else {}}
+    return {"channel": channel, "results": dict(chan.results) if chan else {}, "cleared": chan.cleared if chan else None}
 
 
 @app.put("/results/{channel}/{label}")
@@ -217,9 +235,11 @@ async def put_result(channel: str, label: str, body: dict = Body(...)) -> dict:
         new = _clean_result(body)
     except ValueError as e:
         raise HTTPException(422, str(e))
-    if channel not in _channels and sum(1 for c in _channels.values() if c.results) >= MAX_CHANNELS_WITH_RESULTS:
-        raise HTTPException(507, "relay full")
+    _room_for(channel)
     chan = _channel(channel)
+    if chan.cleared is not None and _when(new) <= _when(chan.cleared):
+        # from before the channel was cleared: a device that missed the clear
+        return {"stored": False, "result": chan.results.get(label), "cleared": chan.cleared}
     old = chan.results.get(label)
     if old is not None and _when(old) >= _when(new):
         return {"stored": False, "result": old}  # what's here is as new or newer
@@ -228,6 +248,26 @@ async def put_result(channel: str, label: str, body: dict = Body(...)) -> dict:
     chan.results[label] = new
     await _to_watchers(chan, {"type": "result", "label": label, "result": new})
     return {"stored": True, "result": new}
+
+
+@app.delete("/results/{channel}")
+async def clear_results(channel: str, at: str, source: str = "") -> dict:
+    """Clears the channel up to `at`. Each result it covers becomes a deletion
+    marker, so a client that predates clearing drops its copy too."""
+    try:
+        new = _clean_clear(at, source)
+    except ValueError as e:
+        raise HTTPException(422, str(e))
+    _room_for(channel)
+    chan = _channel(channel)
+    if chan.cleared is not None and _when(chan.cleared) >= _when(new):
+        return {"cleared": False, "marker": chan.cleared}  # cleared as late or later already
+    chan.cleared = new
+    for label, r in list(chan.results.items()):
+        if _when(r) <= _when(new):
+            chan.results[label] = {"deleted": True, "at": new["at"], "source": new["source"]}
+    await _to_watchers(chan, {"type": "cleared", "cleared": new})
+    return {"cleared": True, "marker": new}
 
 
 @app.websocket("/ws/relay/{channel}")

@@ -37,9 +37,7 @@ async function checkRelay() {
     clearTimeout(t);
   }
   if (seq !== relayCheckSeq) return; // a newer check (address changed) owns the display
-  if (!isErr) { // upload anything surveyed while the relay was unreachable
-    try { const c = localStorage.getItem(LAST_CHANNEL_KEY); if (c) syncResults(c); } catch (e) { /* no storage */ }
-  }
+  if (!isErr) syncKnown(); // upload anything surveyed while the relay was unreachable
   el.className = isErr ? "status inline err" : "status inline";
   el.textContent = msg;
   if (isErr) el.closest("details").open = true; // show the address to fix
@@ -207,10 +205,13 @@ function rememberChannel(channel) {
   try { localStorage.setItem(LAST_CHANNEL_KEY, channel); } catch (e) { /* private mode */ }
 }
 
+/** The rover's channel: where its points are saved, and whose saved results the panel lists. */
+const roverChannel = () => $("usbChannel").value.trim() || "default";
+
 /** Stores a result on this device (synchronously) and starts uploading it.
  * onSync(text, ok) reports the upload. Returns false if nothing could be stored. */
 function saveSurveyResult(r, channel, onSync) {
-  channel = channel || $("usbChannel").value.trim() || "default";
+  channel = channel || roverChannel();
   rememberChannel(channel);
   try {
     Results.record(channel, r.label, { lat_deg: r.lat_deg, lon_deg: r.lon_deg, height_msl_m: r.height_msl_m, n: r.n, spread_m: r.spread_m, all_fixed: r.all_fixed }, "web console");
@@ -222,12 +223,62 @@ function saveSurveyResult(r, channel, onSync) {
 }
 
 let syncing = Promise.resolve();
+const syncErrors = {}; // channel -> what went wrong in its last sync (null: in step with the relay)
 function syncResults(channel) {
-  syncing = syncing.then(() => Results.sync(serverUrl, channel));
+  syncing = syncing.then(() => Results.sync(serverUrl, channel)).then((res) => {
+    syncErrors[channel] = res.error;
+    renderStored();
+    return res;
+  });
   return syncing;
 }
-// retry anything not yet uploaded (relay asleep / offline when surveyed)
-setInterval(() => { try { const c = localStorage.getItem(LAST_CHANNEL_KEY); if (c) syncResults(c); } catch (e) { /* no storage */ } }, 60000);
+/** The last channel surveyed on, and the one the rover panel shows. */
+function syncKnown() {
+  let last = null;
+  try { last = localStorage.getItem(LAST_CHANNEL_KEY); } catch (e) { /* no storage */ }
+  for (const c of new Set([last, roverChannel()])) if (c) syncResults(c);
+}
+// retry anything not yet uploaded (relay asleep / offline when surveyed), and
+// pick up what other devices surveyed or cleared
+setInterval(syncKnown, 60000);
+
+function renderStored() {
+  const ch = roverChannel(), all = Results.loadLocal(ch), names = Results.labels(all), c = all[Results.CLEARED];
+  let t = names.length ? `Saved on channel "${ch}": ${names.join(", ")}`
+    : `Nothing saved on channel "${ch}"` + (c ? ` - cleared ${new Date(c.at).toLocaleString()}${c.source ? ` (${c.source})` : ""}` : " yet");
+  if (syncErrors[ch]) t += ` · relay: ${syncErrors[ch]} - retried every minute`;
+  $("storedResults").textContent = t;
+  $("clearResults").disabled = !names.length;
+}
+
+$("clearResults").onclick = async () => {
+  const ch = roverChannel(), names = Results.labels(Results.loadLocal(ch));
+  if (!names.length) return;
+  const choice = await warningBox({
+    title: `Delete the survey results on channel "${ch}"?`,
+    body: [`${names.length} result(s): ${names.join(", ")}.`,
+      "They are deleted from this device, the relay and every device on this channel; each drops them at its next sync. " +
+      "The origin fields here are emptied too. This can't be undone."],
+    choices: [{ value: "delete", label: "Delete everywhere", danger: true }],
+    cancel: "Keep them stored",
+  });
+  if (choice !== "delete") return;
+  Results.clear(ch, "web console");
+  for (const id of ["originLat", "originLon", "originAlt"]) $(id).value = "";
+  $("usbResult").replaceChildren();
+  renderStored();
+  syncResults(ch);
+};
+
+let storedTimer = null;
+$("usbChannel").addEventListener("input", () => {
+  renderStored();
+  clearTimeout(storedTimer);
+  storedTimer = setTimeout(() => syncResults(roverChannel()), 800);
+});
+// the Site map (or another console) in this browser saved or cleared something
+window.addEventListener("storage", (e) => { if (e.key === `gnss_results:${roverChannel()}`) renderStored(); });
+renderStored();
 
 function shareLive(pvt) {
   if (!pvt || pvt.fixType < 2) return;
@@ -301,7 +352,7 @@ if (!("serial" in navigator)) {
 async function usbRunSession(mode) {
   const conn = usbConn;
   if (!conn || !conn.alive) { setStatus("usb", "connect a USB receiver first", true); return; }
-  const channel = $("usbChannel").value.trim() || "default";
+  const channel = roverChannel();
   const label = $("usbLabel").value.trim() || "point";
   if (mode === "point" && !Results.LABEL_RE.test(label)) { setStatus("usb", "label: letters, digits, _ . - only (e.g. camera_a)", true); return; }
   const durationS = parseFloat($("usbDuration").value);
@@ -313,6 +364,17 @@ async function usbRunSession(mode) {
       if (label !== "origin") origin = readOrigin();
     }
   } catch (e) { setStatus("usb", e.message, true); return; }
+  const prev = mode === "point" && Results.loadLocal(channel)[label];
+  if (prev && !prev.deleted) {
+    const choice = await warningBox({
+      title: `Replace "${label}"?`,
+      body: [`Channel "${channel}" already has "${label}": surveyed ${new Date(prev.at).toLocaleString()}${prev.source ? ` (${prev.source})` : ""}, ` +
+        `${prev.n} epochs, spread ${Number(prev.spread_m).toFixed(3)} m, fix=${prev.all_fixed}.`,
+        "Surveying it again replaces that result on every device."],
+      choices: [{ value: "replace", label: "Survey again and replace it", danger: true }],
+    });
+    if (choice !== "replace" || usbRunning) return;
+  }
 
   usbStopRequested = false;
   usbRunning = true;

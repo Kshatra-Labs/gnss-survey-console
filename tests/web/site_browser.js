@@ -3,6 +3,8 @@
 // live rover (BroadcastChannel) through the console's real functions, the aim
 // panel, and Open file... -> Write survey into it -> Save to the file giving
 // exactly the text that check_site_config.py verified with the tracker's code.
+// Then the warning boxes with real keys and at phone width, and a clear
+// reaching the other tab and the Android bridge.
 //
 //   NODE_PATH=<dir with ws> node tests/web/site_browser.js [--page https://...] [--shots DIR]
 "use strict";
@@ -255,6 +257,7 @@ async function main() {
         saveConfig: (t) => { __calls.push(["save", t]); setTimeout(() => siteAndroid.configSaved(true, "saved cameras.local.yaml and read it back"), 10); },
         saveConfigAs: (t) => __calls.push(["saveAs", t]),
         copy: (t) => __calls.push(["copy", t]),
+        mergeResults: (ch, json) => __calls.push(["merge", ch, json]),
       };` });
     await appTab.send("Page.navigate", { url: pageBase + "site.html" });
     await appTab.waitFor(`document.getElementById('channel').value === ${JSON.stringify(SITE2)} && document.getElementById('pairOut').innerText.includes('Distance')`, 20000, "app mode: relay results");
@@ -297,6 +300,65 @@ async function main() {
       const c = await consoleTab.shot(path.join(shots, "console.png"), 1280, 900);
       log(`screenshots in ${shots} (desktop ${d.height}px, phone ${m.height}px, no sideways scroll; console ${c.height}px)`);
     }
+
+    // ---- warning boxes in a real browser; a clear reaches the other tab and the app ----
+    const BOX = "document.querySelector('.wb')";
+    const pick = (t, v) => t.eval(`document.querySelector('.wb [data-choice="${v}"]').click(); 1`);
+    const key = async (t, k, code) => {
+      for (const type of ["keyDown", "keyUp"]) await t.send("Input.dispatchKeyEvent", { type, key: k, code: k, windowsVirtualKeyCode: code });
+    };
+    const focused = (t) => t.eval("document.activeElement.textContent");
+
+    const ref0 = y.refs[0].name;
+    await tab.eval("document.querySelector('[data-ref=\"0\"] h3 button').click(); 1");
+    const rm = await tab.waitFor(`${BOX} && ${BOX}.innerText`, 5000, "remove warning");
+    assert.match(rm, new RegExp(`Remove "${ref0}" everywhere\\?[\\s\\S]*deleted from the relay and every device on channel "${SITE}"`));
+    assert.equal(await focused(tab), "Keep it", "the safe choice has the focus");
+    await key(tab, "Tab", 9);
+    assert.equal(await focused(tab), "Remove everywhere");
+    await key(tab, "Tab", 9);
+    assert.equal(await focused(tab), "Keep it", "Tab stays inside the box");
+    await key(tab, "Escape", 27);
+    assert.equal(await tab.eval(`${BOX} === null && state.refs[0].name`), ref0, "Esc keeps it");
+    await tab.eval("document.querySelector('[data-ref=\"0\"] h3 button').click(); 1");
+    await tab.waitFor(BOX, 5000, "remove warning again");
+    await pick(tab, "remove");
+    assert.ok(!(await tab.eval("state.refs.map((r) => r.name)")).includes(ref0));
+    const t2 = Date.now();
+    while (!((await onRelay())[ref0] || {}).deleted) { if (Date.now() - t2 > 15000) throw new Error(`${ref0} never deleted on the relay`); await sleep(300); }
+    log(`removing surveyed "${ref0}": warning box (focus on "Keep it", Tab trapped, Esc keeps it), then "Remove everywhere" deletes it on the relay`);
+
+    await tab.send("Emulation.setDeviceMetricsOverride", { width: 390, height: 844, deviceScaleFactor: 1, mobile: true });
+    await tab.eval("document.getElementById('clearPoints').click(); 1");
+    const fit = await tab.waitFor(`${BOX} && (() => { const r = ${BOX}.getBoundingClientRect(); return { left: r.left, right: r.right, bottom: r.bottom, sw: document.documentElement.scrollWidth }; })()`, 5000, "clear box on a phone");
+    assert.ok(fit.left >= 16 && fit.right <= 390 - 16 && fit.bottom <= 844 && fit.sw <= 390, `clear box on a 390 px phone: ${JSON.stringify(fit)}`);
+    await pick(tab, "");
+    await tab.send("Emulation.clearDeviceMetricsOverride");
+    log("the Clear box fits a 390 px phone screen with 16 px margins, no sideways scroll");
+
+    await tab.eval("document.getElementById('clearPoints').click(); 1");
+    assert.match(await tab.waitFor(`${BOX} && ${BOX}.innerText`, 5000, "clear box"), /Clear this page, keep the results stored[\s\S]*Delete the results everywhere/);
+    await pick(tab, "everywhere");
+    assert.equal(await tab.eval("state.refs.length + [state.points.origin.lat, state.points.camera_a.lat].join('').length"), 0, "page emptied");
+    const t3 = Date.now();
+    for (;;) {
+      const r = await (await fetch(`${relayBase}/results/${SITE}`)).json();
+      if (r.cleared && r.cleared.source === "site map" && Object.values(r.results).every((x) => x.deleted)) break;
+      if (Date.now() - t3 > 15000) throw new Error("the Site map's clear never reached the relay: " + JSON.stringify(r));
+      await sleep(300);
+    }
+    await consoleTab.waitFor(`/^Nothing saved on channel "${SITE}" - cleared .*\\(site map\\)$/.test(document.getElementById('storedResults').innerText)`, 10000, "the console tab hears of it");
+    log("Site map 'Delete the results everywhere': page emptied, relay cleared, the console tab in the same browser shows it at once");
+
+    await appTab.eval("document.getElementById('clearPoints').click(); 1");
+    await appTab.waitFor(BOX, 5000, "app mode: clear box");
+    await pick(appTab, "everywhere");
+    const handed = await appTab.eval("JSON.parse(__calls.filter((c) => c[0] === 'merge').pop()[2])");
+    assert.deepEqual(Object.keys(handed), ["*"], "app mode: the clear handed to the app's own copy");
+    assert.equal(handed["*"].source, "Android app");
+    await appTab.eval("syncNow()"); // the app still hands over its older app_mast: the clear keeps it out
+    assert.equal(await appTab.eval("state.refs.length"), 0);
+    log("app mode: the clear goes to the app through the bridge, and the app's older copy can't bring points back");
 
     const errs = [...consoleTab.errors, ...tab.errors, ...appTab.errors];
     assert.deepEqual(errs, [], "page errors");

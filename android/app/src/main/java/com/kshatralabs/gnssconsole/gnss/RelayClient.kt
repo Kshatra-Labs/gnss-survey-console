@@ -254,12 +254,25 @@ object RelayClient {
         baseUrl(backendUrl).newBuilder().addPathSegment("results").addPathSegment(channel)
             .apply { if (label != null) addPathSegment(label) }.build()
 
-    /** GET /results/{channel}: label -> result. Blocking; throws IOException. */
+    /** GET /results/{channel}: label -> result, and the channel's clear (if
+     * any) under Results.CLEARED. Blocking; throws IOException. */
     fun getResults(backendUrl: String, channel: String): JSONObject =
         httpClient.newCall(Request.Builder().url(resultsUrl(backendUrl, channel)).build()).execute().use { r ->
             if (!r.isSuccessful) throw IOException("HTTP ${r.code}")
-            JSONObject(r.body!!.string()).optJSONObject("results") ?: JSONObject()
+            val body = JSONObject(r.body!!.string())
+            val results = body.optJSONObject("results") ?: JSONObject()
+            body.optJSONObject("cleared")?.let { results.put(Results.CLEARED, it) }
+            results
         }
+
+    /** DELETE /results/{channel}: clears the channel up to `clear`'s time. Blocking; throws IOException. */
+    fun clearResults(backendUrl: String, channel: String, clear: JSONObject) {
+        val url = resultsUrl(backendUrl, channel).newBuilder()
+            .addQueryParameter("at", clear.getString("at")).addQueryParameter("source", clear.optString("source")).build()
+        httpClient.newCall(Request.Builder().url(url).delete().build()).execute().use { r ->
+            if (!r.isSuccessful) throw IOException("HTTP ${r.code}")
+        }
+    }
 
     /** PUT /results/{channel}/{label}. Blocking; throws IOException. */
     fun putResult(backendUrl: String, channel: String, label: String, result: JSONObject) {

@@ -307,6 +307,62 @@ class SessionE2ETest {
     }
 
     @Test
+    fun g_clearEverywhere() {
+        val ch = "clr-" + System.nanoTime()
+        val phone = Results(MemKv())
+        val other = Results(MemKv()) // a second phone on the channel
+        phone.record(ch, PointResult("origin", 17.3850123, 78.4867456, 540.1, 60, 0.008, true))
+        phone.record(ch, PointResult("camera_a", 17.3850304, 78.4868399, 540.6, 60, 0.007, true))
+        assertEquals(2, phone.sync(url, ch).pushed)
+        other.sync(url, ch)
+        assertEquals(listOf("camera_a", "origin"), Results.labels(other.load(ch)).sorted())
+        other.record(ch, PointResult("mast", 17.39, 78.49, 560.0, 60, 0.009, true)) // surveyed offline: never reached the relay
+        Thread.sleep(5)
+
+        // "Delete everywhere" on this phone
+        val clear = phone.clear(ch, "Android app")
+        assertTrue(Results.labels(phone.load(ch)).isEmpty())
+        val up = phone.sync(url, ch)
+        assertEquals(null, up.error); assertEquals(1, up.pushed)
+        val onRelay = RelayClient.getResults(url, ch)
+        assertEquals(clear.getString("at"), onRelay.getJSONObject(Results.CLEARED).getString("at"))
+        assertTrue(Results.labels(onRelay).isEmpty())
+
+        // the other phone comes back: drops all of it, its offline "mast" too, and uploads none of it
+        assertEquals(0, other.sync(url, ch).pushed)
+        assertTrue(Results.labels(other.load(ch)).isEmpty())
+        assertTrue(Results.labels(RelayClient.getResults(url, ch)).isEmpty())
+
+        // surveyed after the clear: kept and shared
+        Thread.sleep(5)
+        phone.record(ch, PointResult("camera_b", 17.3849671, 78.4870218, 541.3, 60, 0.008, true))
+        assertEquals(1, phone.sync(url, ch).pushed)
+        assertEquals(listOf("camera_b"), Results.labels(other.sync(url, ch).results))
+
+        // a device whose clock is an hour ahead clears: a phone that has seen that clear
+        // still keeps what it surveys afterwards
+        val ahead = org.json.JSONObject().put("at", java.time.Instant.now().plusSeconds(3600).toString()).put("source", "fast clock")
+        RelayClient.clearResults(url, ch, ahead)
+        assertTrue(Results.labels(other.sync(url, ch).results).isEmpty())
+        other.record(ch, PointResult("stake", 17.38, 78.48, 540.0, 30, 0.01, true))
+        assertEquals(1, other.sync(url, ch).pushed)
+        assertEquals(listOf("stake"), Results.labels(RelayClient.getResults(url, ch)))
+
+        // a relay that forgot everything gets an old copy first, then this phone's clear
+        val (fresh, freshUrl) = startExtraRelay()
+        try {
+            val stale = org.json.JSONObject().put("lat_deg", 17.0).put("lon_deg", 78.0).put("height_msl_m", 540.0).put("n", 60)
+                .put("spread_m", 0.01).put("all_fixed", true).put("at", "2026-01-01T00:00:00Z").put("source", "missed the clear")
+            RelayClient.putResult(freshUrl, ch, "origin", stale)
+            assertEquals(2, phone.sync(freshUrl, ch).pushed) // the clear, camera_b
+            val got = RelayClient.getResults(freshUrl, ch)
+            assertEquals(clear.getString("at"), got.getJSONObject(Results.CLEARED).getString("at"))
+            assertEquals(listOf("camera_b"), Results.labels(got))
+            assertTrue("the stale copy is now a deletion marker", got.getJSONObject("origin").getBoolean("deleted"))
+        } finally { fresh.destroy() }
+    }
+
+    @Test
     fun f_mergeRules() {
         fun r(at: String, v: Double) = org.json.JSONObject().put("at", at).put("lat_deg", v)
         val a = org.json.JSONObject().put("x", r("2026-10-13T10:00:00Z", 1.0)).put("y", r("2026-10-13T10:00:00.500Z", 2.0))
@@ -316,5 +372,15 @@ class SessionE2ETest {
         assertEquals(3.0, m.getJSONObject("y").getDouble("lat_deg"), 0.0)
         assertEquals(4.0, m.getJSONObject("z").getDouble("lat_deg"), 0.0)
         assertTrue(Results.LABEL_RE.matches("camera_a") && Results.LABEL_RE.matches("ref.1-b") && !Results.LABEL_RE.matches("a b"))
+        assertFalse("the clear's key is never a label", Results.LABEL_RE.matches(Results.CLEARED))
+
+        // a clear removes what it covers and stays itself; an older copy can't come back
+        fun clearAt(at: String) = org.json.JSONObject().put(Results.CLEARED, org.json.JSONObject().put("at", at))
+        val c = Results.merge(m, clearAt("2026-10-13T10:00:00.500Z"))
+        assertEquals(listOf(Results.CLEARED, "y"), c.keys().asSequence().sorted().toList())
+        assertEquals(listOf("y"), Results.labels(c))
+        assertEquals(listOf("y"), Results.labels(Results.merge(c, a)))
+        assertTrue("a tie goes to the clear", Results.labels(Results.merge(c, clearAt("2026-10-13T10:00:01+00:00"))).isEmpty())
+        assertTrue(Results.labels(org.json.JSONObject().put("x", org.json.JSONObject().put("deleted", true).put("at", "2026-10-13T11:00:00Z"))).isEmpty())
     }
 }

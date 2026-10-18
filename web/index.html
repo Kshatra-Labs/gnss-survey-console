@@ -45,6 +45,8 @@
   .result { margin-top: 10px; }
   .result code { display: block; background: #0b0f13; padding: 8px; border-radius: 6px; font-size: 12px; overflow-x: auto; }
   small.hint { color: var(--muted); display: block; margin-top: 4px; }
+  .stored { margin-top: 14px; padding-top: 10px; border-top: 1px solid var(--border); font-size: 12.5px; color: var(--muted); }
+  .stored button { margin-top: 8px; }
   details { margin-top: 12px; }
   details summary { cursor: pointer; color: var(--muted); font-size: 12.5px; }
   details[open] summary { margin-bottom: 8px; }
@@ -146,6 +148,10 @@
     </div>
     <div id="usbStatus" class="status">idle</div>
     <div id="usbResult" class="result"></div>
+    <div class="stored">
+      <div id="storedResults"></div>
+      <button id="clearResults" class="secondary" disabled>Clear results...</button>
+    </div>
   </div>
 
 </div>
@@ -154,6 +160,7 @@
 <script src="wgs84.js"></script>
 <script src="webserial.js"></script>
 <script src="results.js"></script>
+<script src="dialog.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

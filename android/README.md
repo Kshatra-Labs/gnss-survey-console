@@ -32,7 +32,11 @@ or copy the APK to the phone and open it (allow "install unknown apps").
    working; survey `origin` first, then `camera_a`, `camera_b` (the chips
    fill the label), and any reference points. Each result is kept on the
    phone and uploaded; the line under it says whether the relay has it
-   (if not, it is retried every minute).
+   (if not, it is retried every minute). Surveying a label that already
+   has a result asks first. **Saved on channel ...** lists what the
+   channel holds; **Clear results...** -> **Delete everywhere** deletes it
+   from the phone, the relay and every device on the channel (see
+   "Clearing results" in the main README).
 5. **Rover - live monitor** - watch the fix without recording. Starting a
    point survey on the same receiver stops the monitor automatically; the
    Base's receiver can't be taken by a rover.
@@ -77,7 +81,7 @@ chip: add its vendor/product ID there.
 | `gnss/UsbGnssConnection.kt` | framing, ACKs, auto-baud, rover/base setup over a `SerialIo` (USB port, or a simulator in tests) |
 | `gnss/UsbRover.kt` | USB discovery, permission, opening; `PortLocks` (which session owns which receiver) |
 | `gnss/RelayClient.kt` | relay WebSocket (RTCM-only upload / download, live fix up), channel status, results GET/PUT, health check |
-| `gnss/Results.kt` | the phone's survey results per channel, synced with the relay (same scheme as `web/results.js`) |
+| `gnss/Results.kt` | the phone's survey results per channel, synced with the relay and cleared everywhere (same scheme as `web/results.js`) |
 | `SiteMapHost.kt` | the Site map tab: the bundled `web/site.html` in a WebView, and its `AndroidSite` bridge (relay, channel, results, file picker) |
 | `gnss/Sessions.kt` | `BaseSession` and `RoverSession` - the actual survey logic, plain Kotlin |
 | `gnss/LocalBaseController.kt`, `gnss/LocalRoverController.kt` | run sessions on a thread, expose Compose state |

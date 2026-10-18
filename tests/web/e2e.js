@@ -352,6 +352,84 @@ async function main() {
   assert.match(outYaml, /camera_a:\n      host: "x"\n      origin_e: [-\d.]+\n/, "unrelated lines untouched");
   assert.match(outYaml, /origin_u: [-\d.]+  # m\n/, "comments kept");
   log("Site map wrote origin + both poles + pole_distance_m: 0.0 into a pasted config");
+
+  // ---- clearing, behind warning boxes: keep the results stored, or delete them everywhere ----
+  const box = (pg) => pg.doc.querySelector(".wb");
+  async function choose(pg, value, what) {
+    const b = await waitFor(pg, () => box(pg), 5000, `warning box: ${what}`);
+    const text = b.textContent;
+    b.querySelector(`[data-choice="${value}"]`).click();
+    assert.equal(box(pg), null, "the box closes");
+    return text;
+  }
+  const relayResults = async () => (await (await fetch(`${relayUrl}/results/${SITE}`)).json());
+  async function relayUntil(pred, what) {
+    for (const t0 = Date.now(); ; await sleep(200)) {
+      const r = await relayResults();
+      if (pred(r)) return r;
+      if (Date.now() - t0 > 15000) throw new Error(`relay never had ${what}: ${JSON.stringify(r)}`);
+    }
+  }
+  const live = (r) => Object.keys(r.results).filter((k) => !r.results[k].deleted);
+  const setInput = (pg, sel, v) => { const e = pg.doc.querySelector(sel); e.value = v; e.dispatchEvent(new pg.win.Event("input")); };
+
+  assert.match(text(p, "storedResults"), new RegExp(`^Saved on channel "${SITE}": origin, camera_a, camera_b$`));
+  p.$("usbLabel").value = "camera_b";
+  p.$("usbStart").click();
+  const replaceBox = await waitFor(p, () => box(p), 5000, "replace warning");
+  assert.match(replaceBox.textContent, /Replace "camera_b"\?.*already has "camera_b": surveyed .* \(web console\), \d+ epochs, spread 0\.\d{3} m, fix=true\..*replaces that result on every device/);
+  assert.equal(p.doc.activeElement.textContent, "Cancel", "the safe choice has the focus");
+  p.doc.dispatchEvent(new p.win.KeyboardEvent("keydown", { key: "Escape" }));
+  assert.equal(box(p), null);
+  await sleep(500);
+  assert.ok(p.$("usbStop").disabled && /monitor stopped/.test(text(p, "usbStatus")), "Esc: no survey started");
+  log("re-surveying an existing label asks first (what it replaces, everywhere); Esc cancels, nothing starts");
+
+  s$("clearPoints").click();
+  const clearText = await choose(sitePage, "page", "Site map clear");
+  assert.match(clearText, new RegExp(`Clear the points on channel "${SITE}"\\?3 survey result\\(s\\) stored on this channel: origin, camera_a, camera_b\\.` +
+    "Clear this page, keep the results stored.*Load survey results brings them back.*Delete the results everywhere.*can't be undone"));
+  assert.match(s$("pairOut").textContent, /Load or enter both/);
+  await sitePage.win.eval("syncNow()");
+  assert.match(s$("pairOut").textContent, /Load or enter both/, "a sync doesn't bring them back");
+  assert.match(s$("syncNote").textContent, /3 kept stored but cleared from this page/);
+  assert.deepEqual(live(await relayResults()), ["origin", "camera_a", "camera_b"], "still on the relay");
+  s$("loadSurvey").click();
+  await waitFor(sitePage, () => /Distance/.test(s$("pairOut").textContent), 10000, "Load survey results brings them back");
+  log("Site map 'Clear this page, keep the results stored': page empty, stays so after a sync, relay untouched; Load survey results restores");
+
+  const surveyedLat = sitePage.win.eval("state.points.camera_a.lat");
+  setInput(sitePage, '[data-point="camera_a"] input[data-key="lat"]', "17.1");
+  s$("loadSurvey").click();
+  assert.match(await choose(sitePage, "", "hand edits"), /camera_a was typed or edited by hand.*Keep my edits/);
+  assert.equal(sitePage.win.eval("state.points.camera_a.lat"), "17.1", "Keep my edits");
+  s$("loadSurvey").click();
+  await choose(sitePage, "load", "hand edits again");
+  assert.equal(sitePage.win.eval("state.points.camera_a.lat"), surveyedLat, "replaced with the survey");
+  setInput(sitePage, '[data-point="origin"] input[data-key="h"]', "540.5"); // a hand edit a clear elsewhere must not take
+  log("Load survey results over hand edits asks first: 'Keep my edits' keeps them, 'Replace' loads the survey");
+
+  p.$("clearResults").click();
+  assert.match(await choose(p, "", "console clear"), new RegExp(`Delete the survey results on channel "${SITE}"\\?3 result\\(s\\): origin, camera_a, camera_b\\..*can't be undone.*Keep them stored.*Delete everywhere`));
+  assert.deepEqual(live(await relayResults()), ["origin", "camera_a", "camera_b"], "Keep them stored: nothing deleted");
+  p.$("clearResults").click();
+  await choose(p, "delete", "console clear, again");
+  assert.equal(p.$("originLat").value + p.$("usbResult").textContent, "", "origin fields and the old result emptied");
+  await waitFor(p, () => new RegExp(`^Nothing saved on channel "${SITE}" - cleared .* \\(web console\\)$`).test(text(p, "storedResults")) && p.$("clearResults").disabled, 10000, "console: cleared");
+  await relayUntil((r) => r.cleared && r.cleared.source === "web console" && live(r).length === 0, "the console's clear");
+  await waitFor(sitePage, () => /results cleared .*\(web console\)/.test(s$("syncNote").textContent), 10000, "the other device hears of it (live link)");
+  assert.equal(sitePage.win.eval("[state.points.camera_a.lat, state.points.camera_b.lat].join('')"), "", "surveyed points gone on the other device");
+  assert.equal(sitePage.win.eval("state.points.origin.h"), "540.5", "a hand edit there stays");
+  log("console 'Delete everywhere': relay cleared, this device's copy cleared, the Site map on another device drops the surveyed points (hand edits stay)");
+
+  p.$("usbDuration").value = "4";
+  p.$("usbStart").click(); // camera_b is gone, so no question this time
+  await waitFor(p, () => /DONE "camera_b"/.test(text(p, "usbStatus")) || /ERROR/.test(text(p, "usbStatus")), 30000, "camera_b after the clear");
+  assert.equal(box(p), null);
+  await waitFor(p, () => new RegExp(`^Saved on channel "${SITE}": camera_b$`).test(text(p, "storedResults")), 20000, "stored after the clear");
+  await relayUntil((r) => live(r).join() === "camera_b", "camera_b alone");
+  await waitFor(sitePage, () => sitePage.win.eval("state.points.camera_b.lat") !== "", 10000, "the new point reaches the other device");
+  log("a point surveyed after the clear is kept, uploaded and shown on the other device");
   sitePage.win.eval("watch.stop()");
   sitePage.win.close();
 

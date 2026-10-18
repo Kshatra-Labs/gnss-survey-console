@@ -45,6 +45,12 @@ import com.kshatralabs.gnssconsole.gnss.fmt
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
+import org.json.JSONObject
+import java.time.OffsetDateTime
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
+import java.time.format.FormatStyle
+import java.util.concurrent.ConcurrentHashMap
 
 private const val PREFS = "gnss_console_prefs"
 private const val RESULTS_PREFS = "gnss_results"
@@ -84,13 +90,17 @@ class ConsoleViewModel(app: Application) : AndroidViewModel(app) {
     /** Upload state of the latest point result, shown under it. */
     var syncText by mutableStateOf<String?>(null)
     var syncOk by mutableStateOf<Boolean?>(null)
+    /** Bumped whenever this phone's stored results may have changed; syncErrors: channel -> last sync's error. */
+    var storedTick by mutableIntStateOf(0)
+        private set
+    val syncErrors = ConcurrentHashMap<String, String>()
     /** Set by the Activity: runs JavaScript in the Site map page. */
     @Volatile var siteJs: (String) -> Unit = {}
     @Volatile private var cleared = false
     @Volatile private var lastPvtToSite = 0L
 
     init {
-        point.onResult = { r, ch -> results.record(ch, r); syncText = "uploading to the relay..."; syncOk = null; syncNow(ch) }
+        point.onResult = { r, ch -> results.record(ch, r); storedTick++; syncText = "uploading to the relay..."; syncOk = null; syncNow(ch) }
         point.onPvt = ::pvtToSite
         monitor.onPvt = ::pvtToSite
         // anything surveyed while the relay was unreachable goes up as soon as it answers
@@ -112,8 +122,25 @@ class ConsoleViewModel(app: Application) : AndroidViewModel(app) {
             syncText = if (o.error == null) "on the relay: the Site map on any device sees it (channel \"$channel\")"
             else "not on the relay yet (${o.error}) - kept on this phone, retried every minute"
         }
+        if (o.error != null) syncErrors[channel] = o.error else syncErrors.remove(channel)
+        storedTick++
         siteJs("siteAndroid.resultsChanged()")
     }.apply { isDaemon = true; start() }
+
+    /** "Delete everywhere": this phone now, the relay and every other device from the sync on. */
+    fun clearResults(channel: String) {
+        results.clear(channel, "Android app")
+        point.forgetResult()
+        originLat = ""; originLon = ""; originAlt = ""
+        storedTick++
+        syncNow(channel, quiet = true)
+    }
+
+    /** The Site map page changed the channel (cleared it, removed a point): take its copy in. */
+    fun adoptFromSite(channel: String, json: String) {
+        runCatching { results.adopt(channel, JSONObject(json)) }
+        storedTick++
+    }
 
     private fun pvtToSite(pvt: com.kshatralabs.gnssconsole.gnss.Ubx.NavPvt?) {
         val now = System.currentTimeMillis()
@@ -439,6 +466,12 @@ private fun PointCard(vm: ConsoleViewModel, c: LocalRoverController, ports: List
     val d = duration.toDoubleOrNull()
     val origin = parseOrigin(vm.originLat, vm.originLon, vm.originAlt)
     val originErr = origin.exceptionOrNull()?.message?.takeIf { label.trim() != "origin" }
+    var replacing by remember { mutableStateOf<JSONObject?>(null) } // the stored result a new survey would replace
+    fun start() {
+        val p = port ?: return
+        val o = if (label.trim() == "origin") null else origin.getOrNull()
+        c.startPoint(context, p, backendUrl, vm.channel, label.trim(), d!!, requireFixed, o)
+    }
 
     ElevatedCard(modifier = Modifier.fillMaxWidth()) {
         Column(Modifier.padding(14.dp)) {
@@ -479,9 +512,8 @@ private fun PointCard(vm: ConsoleViewModel, c: LocalRoverController, ports: List
                 Button(
                     enabled = !c.running && port != null && label.isNotBlank() && labelErr == null && d != null && d > 0 && originErr == null && vm.channel.isNotBlank(),
                     onClick = {
-                        val p = port ?: return@Button
-                        val o = if (label.trim() == "origin") null else origin.getOrNull()
-                        c.startPoint(context, p, backendUrl, vm.channel, label.trim(), d!!, requireFixed, o)
+                        val prev = vm.results.load(vm.channel).optJSONObject(label.trim())
+                        if (prev != null && !prev.optBoolean("deleted")) replacing = prev else start()
                     },
                 ) { Text("Survey this point") }
                 Spacer(Modifier.width(8.dp))
@@ -498,9 +530,71 @@ private fun PointCard(vm: ConsoleViewModel, c: LocalRoverController, ports: List
                     )
                 }
             }
+            StoredResults(vm)
         }
     }
+    replacing?.let { prev ->
+        val l = label.trim()
+        val source = prev.optString("source").takeIf { it.isNotEmpty() }?.let { " ($it)" } ?: ""
+        WarningDialog(
+            title = "Replace \"$l\"?",
+            text = "Channel \"${vm.channel}\" already has \"$l\": surveyed ${localTime(prev.optString("at"))}$source, " +
+                "${prev.optInt("n")} epochs, spread ${fmt(prev.optDouble("spread_m"), 3)} m, fix=${prev.optBoolean("all_fixed")}.\n\n" +
+                "Surveying it again replaces that result on every device.",
+            action = "Survey again and replace it", cancel = "Cancel",
+            onAction = { replacing = null; start() }, onCancel = { replacing = null },
+        )
+    }
 }
+
+/** This phone's saved results on the channel, and "Clear results..." behind a warning. */
+@Composable
+private fun StoredResults(vm: ConsoleViewModel) {
+    LaunchedEffect(vm.channel) { // what other devices surveyed or cleared on it
+        delay(800) // let typing settle
+        if (vm.channel.isNotBlank()) vm.syncNow(vm.channel, quiet = true)
+    }
+    val all = remember(vm.channel, vm.storedTick) { vm.results.load(vm.channel) }
+    val names = Results.labels(all)
+    val cleared = all.optJSONObject(Results.CLEARED)
+    var asking by remember { mutableStateOf(false) }
+    HorizontalDivider(Modifier.padding(top = 12.dp))
+    val line = when {
+        names.isNotEmpty() -> "Saved on channel \"${vm.channel}\": ${names.joinToString(", ")}"
+        cleared != null -> "Nothing saved on channel \"${vm.channel}\" - cleared ${localTime(cleared.optString("at"))}" +
+            (cleared.optString("source").takeIf { it.isNotEmpty() }?.let { " ($it)" } ?: "")
+        else -> "Nothing saved on channel \"${vm.channel}\" yet"
+    } + (vm.syncErrors[vm.channel]?.let { " · relay: $it - retried every minute" } ?: "")
+    Text(line, fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(top = 8.dp))
+    OutlinedButton(enabled = names.isNotEmpty(), onClick = { asking = true }) { Text("Clear results...") }
+    if (asking) WarningDialog(
+        title = "Delete the survey results on channel \"${vm.channel}\"?",
+        text = "${names.size} result(s): ${names.joinToString(", ")}.\n\n" +
+            "They are deleted from this phone, the relay and every device on this channel; each drops them at its next sync. " +
+            "The origin fields here are emptied too. This can't be undone.",
+        action = "Delete everywhere", cancel = "Keep them stored",
+        onAction = { asking = false; vm.clearResults(vm.channel) }, onCancel = { asking = false },
+    )
+}
+
+/** A warning box: what an operation deletes or replaces, the action in red, and a way out. */
+@Composable
+private fun WarningDialog(title: String, text: String, action: String, cancel: String, onAction: () -> Unit, onCancel: () -> Unit) {
+    AlertDialog(
+        onDismissRequest = onCancel,
+        title = { Text(title) },
+        text = { Text(text) },
+        confirmButton = {
+            TextButton(onClick = onAction, colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error)) { Text(action) }
+        },
+        dismissButton = { TextButton(onClick = onCancel) { Text(cancel) } },
+    )
+}
+
+/** An ISO-8601 time in the phone's zone, short form. */
+private fun localTime(at: String): String = runCatching {
+    OffsetDateTime.parse(at).atZoneSameInstant(ZoneId.systemDefault()).format(DateTimeFormatter.ofLocalizedDateTime(FormatStyle.SHORT))
+}.getOrDefault(at)
 
 @Composable
 private fun PointResultView(r: PointResult) {

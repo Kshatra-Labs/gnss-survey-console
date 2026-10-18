@@ -31,6 +31,9 @@ class LocalRoverController(private val name: String, private val preemptible: Bo
 
     fun stop() { stopRequested = true }
 
+    /** Stops showing the last result: its stored copy was deleted. */
+    fun forgetResult() { if (!running) result = null }
+
     private fun launch(context: Context, portRef: UsbPortRef, body: (UsbGnssConnection) -> Unit) {
         if (running) return
         stopRequested = false
